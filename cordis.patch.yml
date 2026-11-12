@@ -50,6 +50,14 @@
 #                      answer on. Empty means use the version this machine's
 #                      Codex CLI last negotiated ($CODEX_HOME/models_cache.json),
 #                      then this plugin's own fallback.
+# apiKeyEnv:           credential reference holding an OpenAI Platform API key.
+#                      Empty falls back to OPENAI_API_KEY, which is also the name
+#                      the Models page writes. The `openai` route is bound to this
+#                      reference, so the key keeps flowing through the Harness
+#                      credential store instead of living inside this plugin.
+# enableApiKeyRoute:   allow the plugin to enable the `openai` route (API key,
+#                      api.openai.com). Set false to keep the plugin strictly on
+#                      the ChatGPT-subscription route.
 
 - insert:
     - id: gpt-codex
@@ -64,3 +72,5 @@
         autoRefreshModels: true
         modelsRefreshHours: 24
         modelsClientVersion: ''
+        apiKeyEnv: 'OPENAI_API_KEY'
+        enableApiKeyRoute: true
