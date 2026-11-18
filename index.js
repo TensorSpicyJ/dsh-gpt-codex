@@ -35,11 +35,20 @@
  * page uses, and it edits the profile override that actually wins.
  */
 
-import { existsSync, promises as fsp } from 'node:fs';
+import { existsSync, promises as fsp, readFileSync } from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
+import {
+  canonicalModels,
+  diffModels,
+  fetchCodexModels,
+  modelsDigest,
+  resolveClientVersion,
+  sameModels,
+  toModelEntries,
+} from './models.js';
 import { installStreamRepair, resolveRepairEndpoints } from './stream-repair.js';
 
 /** Credential-record scope `dsh-llm-pi-ai` reads and writes. */
@@ -59,10 +68,86 @@ const RECORD_KEY = `${RECORD_SCOPE}/${PROVIDER}`;
 /** pi-ai reads the ChatGPT account id from this namespaced JWT claim. */
 const JWT_CLAIM_PATH = 'https://api.openai.com/auth';
 
+/**
+ * Where the Codex CLI keeps its own state directory.
+ *
+ * Mirrors `dsh-home-paths`' rule (trimmed non-empty `$CODEX_HOME`, else `~/.codex`)
+ * rather than restating a path.
+ */
+function codexHome() {
+  const configured = process.env.CODEX_HOME;
+  if (typeof configured === 'string' && configured.trim() !== '') return configured.trim();
+  return path.join(os.homedir(), '.codex');
+}
+
 /** Where the Codex CLI keeps its own ChatGPT login. */
 function codexAuthFile() {
-  const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-  return path.join(home, 'auth.json');
+  return path.join(codexHome(), 'auth.json');
+}
+
+/**
+ * Where the Codex CLI records the model catalog it last fetched.
+ *
+ * Read only for one fact: the `client_version` it negotiated, which the models
+ * endpoint gates its answer on. Using the CLI's own value means a machine whose
+ * Codex is newer than this plugin's fallback still sees every model the CLI sees.
+ */
+function codexModelsCacheFile() {
+  return path.join(codexHome(), 'models_cache.json');
+}
+
+/** The parsed Codex CLI model cache, or undefined when absent or unreadable. */
+function readCodexModelsCache() {
+  const file = codexModelsCacheFile();
+  if (!existsSync(file)) return undefined;
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * This plugin's own cache of the last successful model fetch.
+ *
+ * Lives in the harness home rather than in the workspace: it is machine state,
+ * not project data. Written only after a sync that actually reached the service,
+ * so it never claims a fetch that did not happen.
+ */
+function modelsCacheFile() {
+  const configured = process.env.DSH_HOME;
+  const home = typeof configured === 'string' && configured.trim() !== ''
+    ? configured.trim()
+    : path.join(os.homedir(), '.dsh');
+  return path.join(home, 'gpt-codex-models.json');
+}
+
+/** The parsed cache, or undefined when it does not exist or is unreadable. */
+function readModelsCache() {
+  const file = modelsCacheFile();
+  if (!existsSync(file)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    return parsed !== null && typeof parsed === 'object' ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Persist the cache; a failure here must never fail the sync that produced it. */
+async function writeModelsCache(value) {
+  try {
+    await fsp.mkdir(path.dirname(modelsCacheFile()), { recursive: true });
+    await fsp.writeFile(modelsCacheFile(), JSON.stringify({ ...value, version: 1 }, null, 2), 'utf8');
+  } catch (error) {
+    console.warn('[dsh-gpt-codex] 无法写入模型缓存:', error && error.message ? error.message : error);
+  }
+}
+
+/** How long ago the last successful sync ran, in milliseconds; undefined when never. */
+function modelsCacheAge(cache = readModelsCache()) {
+  const at = cache?.fetchedAt;
+  return typeof at === 'number' && Number.isFinite(at) ? Math.max(0, Date.now() - at) : undefined;
 }
 
 function sendJson(res, status, value) {
@@ -414,11 +499,28 @@ export function apply(ctx, rawConfig) {
     // fixes a reused slot, but a genuinely corrupt argument string can only be
     // recovered by asking the model again.
     retryMalformed: rawConfig?.retryMalformedResponses !== false,
+    // Teach the route which models the plan actually serves. An installed
+    // pi-ai catalog is a snapshot from build time, so without this a model
+    // released later never appears and a retired one stays in the picker.
+    manageModels: rawConfig?.manageModels !== false,
+    // Re-check on start and while loaded (once per `modelsRefreshHours`), so a new
+    // release shows up without anyone pressing a button. Off means the route's
+    // model list is only ever changed by an explicit refresh.
+    autoRefreshModels: rawConfig?.autoRefreshModels !== false,
+    modelsRefreshHours: Number.isFinite(rawConfig?.modelsRefreshHours) && rawConfig.modelsRefreshHours > 0
+      ? Number(rawConfig.modelsRefreshHours)
+      : 24,
+    // Optional pin for the `client_version` the model endpoint gates its answer
+    // on. Unset reads the version Codex CLI last negotiated.
+    modelsClientVersion: rawConfig?.modelsClientVersion ? String(rawConfig.modelsClientVersion) : '',
   };
 
   const authFilePath = () => settings.codexAuthPath || codexAuthFile();
   const credentials = () => ctx.get('credentials');
   const settingsService = () => ctx.get('settings');
+  let disposed = false;
+  const lifetime = new AbortController();
+  ctx.effect(() => () => { disposed = true; lifetime.abort(); });
 
   /** Counters for {@link installStreamRepair}; read by `GET /gpt-codex/stream-repair`. */
   const streamRepairStats = { responses: 0, repairedEvents: 0 };
@@ -461,7 +563,7 @@ export function apply(ctx, rawConfig) {
   const DEFAULT_RETRY_CODES = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'];
 
   /** The route profile this plugin recommends, given its configuration. */
-  const routeProfile = () => {
+  const baseRouteProfile = () => {
     if (!settings.retryMalformed) return { ...ROUTE_PROFILE };
     return {
       ...ROUTE_PROFILE,
@@ -473,6 +575,27 @@ export function apply(ctx, rawConfig) {
     };
   };
 
+  /**
+   * The route profile to write, optionally carrying a model list.
+   *
+   * `modelsDigest` is a marker this plugin owns: it records which list was
+   * generated, so a later sync can tell "the list I wrote" from "a list the user
+   * wrote or edited". The pi-ai profile schema ignores unknown keys and the
+   * settings writer preserves them, which is what makes the marker durable
+   * without a separate state file. A user who edits the list through the
+   * settings form drops the marker, and that is exactly the signal to stop
+   * touching it.
+   *
+   * @param models - the generated entry list, or undefined for a catalog-backed
+   *   route that inherits the installed catalog.
+   * @returns the profile value to store.
+   */
+  const routeProfile = (models) => {
+    const base = baseRouteProfile();
+    if (!Array.isArray(models) || models.length === 0) return base;
+    return { ...base, models, modelsDigest: modelsDigest(models) };
+  };
+
   /** Order-insensitive JSON image, for comparing a stored profile with a target. */
   const stableImage = (value) => {
     if (Array.isArray(value)) return `[${value.map(stableImage).join(',')}]`;
@@ -482,56 +605,286 @@ export function apply(ctx, rawConfig) {
     return JSON.stringify(value);
   };
 
+  /**
+   * Whether a stored profile is one this plugin wrote.
+   *
+   * Three shapes count: the transport-only route an earlier version wrote, the
+   * transport-plus-retry route {@link baseRouteProfile} describes, and either of
+   * those plus a model list whose `modelsDigest` still matches its own content.
+   * Everything else — another transport, a hand-written retry policy, a pinned
+   * or edited model list — belongs to the user and is never overwritten.
+   *
+   * @param current - the stored provider profile.
+   * @returns true when this plugin may rewrite it.
+   */
+  const isOwnProfile = (current) => {
+    if (current === null || typeof current !== 'object' || Array.isArray(current)) return false;
+    const { models, modelsDigest: marker, ...rest } = current;
+    const image = stableImage(rest);
+    if (image !== stableImage(baseRouteProfile()) && image !== stableImage(ROUTE_PROFILE)) return false;
+    if (models === undefined) return true;
+    // A list is ours only while it is still byte-for-byte the list the marker
+    // described. Anything edited in place stops being ours.
+    return typeof marker === 'string' && Array.isArray(models) && models.length > 0
+      // The digest covers generated fields. Reject ANY raw entry additions or
+      // edits outside that shape too (maxTokens, compat, null effort values…).
+      // Ownership reads `user`, never schema-filled defaults.
+      && stableImage(models) === stableImage(canonicalModels(models))
+      && marker === modelsDigest(models);
+  };
+
   /** Whether an existing profile is exactly the shape this plugin recommends. */
-  const sameProfile = (current) => {
+  const sameProfile = (current, models) => {
     if (current === null || typeof current !== 'object') return false;
-    return stableImage(current) === stableImage(routeProfile());
+    return stableImage(current) === stableImage(routeProfile(models));
   };
 
   /**
-   * Whether a stored profile is the shape an earlier version of this plugin
-   * wrote, and nothing else.
+   * Write one provider profile, tolerating a concurrent settings change.
    *
-   * That is indistinguishable from something the user typed, but it is only
-   * `transport: 'sse'` — the recommended transport — so adding the retry policy
-   * cannot contradict a deliberate choice. Anything with another field, another
-   * transport, or a policy of its own stays untouched.
+   * `mutate` takes an expected revision, and anything else that edits the
+   * `llm-pi-ai` section meanwhile (the Models page, another plugin) makes that
+   * revision stale. One re-read is enough: the decision this call makes is
+   * re-derived from the fresh descriptor, not replayed.
+   *
+   * @returns `{ ok: true, revision }` or `{ ok: false, reason }`.
    */
-  const isLegacyOwnProfile = (current) => stableImage(current) === stableImage(ROUTE_PROFILE);
-
-  const ensureRoute = async () => {
+  const writeProviderProfile = async (decide, signal = lifetime.signal, validate) => {
     const service = settingsService();
-    if (service === void 0) return { changed: false, reason: 'no-settings-service' };
+    if (service === void 0) return { ok: false, reason: 'no-settings-service' };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (validate !== undefined && !await validate()) return { ok: false, reason: 'credential-changed' };
+      let descriptor;
+      try {
+        descriptor = service.describe().find((row) => row.ns === SETTINGS_NS);
+      } catch (error) {
+        return { ok: false, reason: `describe failed: ${error && error.message ? error.message : String(error)}` };
+      }
+      if (descriptor === void 0) return { ok: false, reason: 'no-llm-pi-ai-entry' };
+      if (disposed || signal.aborted) return { ok: false, reason: 'aborted' };
+      // Re-derive both ownership AND the target on every attempt. In particular,
+      // a revision conflict is not permission to replay a pre-network decision.
+      const decision = decide(profileFromDescriptor(descriptor));
+      if (decision.value === undefined) return { ok: true, changed: false, ...decision };
+      try {
+        await service.mutate(SETTINGS_NS, [{ op: 'set', path: ['providers', PROVIDER], value: decision.value }], descriptor.revision);
+        return { ok: true, changed: true, ...decision, revision: descriptor.revision };
+      } catch (error) {
+        const conflict = error && (error.code === 'SETTINGS_CONFLICT' || /changed since it was read/.test(String(error.message)));
+        if (!conflict || attempt === 1) {
+          return { ok: false, reason: `mutate failed: ${error && error.message ? error.message : String(error)}` };
+        }
+      }
+    }
+    return { ok: false, reason: 'mutate failed: conflicts kept happening' };
+  };
+
+  /**
+   * The stored `openai-codex` profile, in both shapes the settings service offers.
+   *
+   * `describe()` returns two different views of the same section, and this plugin
+   * needs both:
+   *
+   *  - `value` is the VALIDATED profile — what `llm-pi-ai` actually serves. It
+   *    carries every schema default materialized (`models: []`,
+   *    `streamIdleTimeoutMs: 300000`, an empty `compat` block, …), so it answers
+   *    "what is served" but can never be compared against the object this plugin
+   *    wrote.
+   *  - `user` is the profile-layer section exactly as written, projected onto the
+   *    schema's fields. That is the shape an ownership test needs: a hand-written
+   *    list and a generated one differ there, and only there.
+   *
+   * Comparing the wrong one is silent and total: `value` never equals the written
+   * profile, so every route would look foreign and the plugin would refuse to
+   * update its own model list forever.
+   *
+   * @returns `{ profile, written }` (each possibly undefined) or `{ error }`.
+   */
+  const profileFromDescriptor = (descriptor) => {
+    const profile = descriptor.value?.providers?.[PROVIDER];
+    const written = descriptor.user?.providers?.[PROVIDER] ?? profile;
+    return {
+      profile,
+      written,
+      configured: profile !== undefined,
+      // `base` is validated too. Any inherited provider is deliberately left to
+      // its owner: a partial user override must not hide its custom settings.
+      managed: descriptor.base?.providers?.[PROVIDER] === undefined && isOwnProfile(written),
+    };
+  };
+
+  const readStoredProfile = () => {
+    const service = settingsService();
+    if (service === void 0) return { error: 'no-settings-service' };
     let descriptor;
     try {
       descriptor = service.describe().find((row) => row.ns === SETTINGS_NS);
     } catch (error) {
-      return { changed: false, reason: `describe failed: ${error && error.message ? error.message : String(error)}` };
+      return { error: `describe failed: ${error && error.message ? error.message : String(error)}` };
     }
-    if (descriptor === void 0) return { changed: false, reason: 'no-llm-pi-ai-entry' };
-    const providers = descriptor.value?.providers;
-    if (providers && Object.hasOwn(providers, PROVIDER)) {
-      const current = providers[PROVIDER];
-      if (sameProfile(current)) return { changed: false, reason: 'already-configured' };
-      // A route an earlier version of this plugin wrote is upgraded in place;
-      // anything a user tuned — another transport, a pinned model list, their own
-      // retry policy — always wins.
-      if (!settings.retryMalformed || !isLegacyOwnProfile(current)) {
-        return { changed: false, reason: 'already-configured-differently' };
+    if (descriptor === void 0) return { error: 'no-llm-pi-ai-entry' };
+    return profileFromDescriptor(descriptor);
+  };
+
+  const ensureRoute = async (models) => {
+    const result = await writeProviderProfile((stored) => {
+      const written = stored.written;
+      const configured = stored.configured;
+      // Preserve a generated list on enable, including after a revision retry.
+      const desired = Array.isArray(models) && models.length > 0
+        ? models
+        : Array.isArray(written?.models) && written.models.length > 0 ? written.models : undefined;
+      if (configured && !stored.managed) return { reason: 'already-configured-differently' };
+      if (configured && sameProfile(written, desired)) return { reason: 'already-configured' };
+      return { value: routeProfile(desired), reason: configured ? 'upgraded' : 'added' };
+    });
+    return { changed: result.ok && result.changed === true, reason: result.reason };
+  };
+
+  /**
+   * Keep the route's model list in step with what the plan actually serves.
+   *
+   * This is the answer to "a new GPT model shipped and the picker still shows the
+   * old list". pi-ai's catalog is a JSON file inside the application, written at
+   * build time, and `dsh-llm-pi-ai` deliberately does not refresh it for OAuth
+   * providers (`discovery.ts` excludes the Codex protocol). So the served list is
+   * *configured*: this plugin asks the Codex models endpoint, maps the answer into
+   * route entries and writes them into the profile it owns.
+   *
+   * Who is allowed to be rewritten is the whole safety argument: only a route
+   * whose list still matches the marker this plugin wrote is touched. A route the
+   * user pinned by hand, narrowed, or edited keeps its list forever, and the
+   * report says so (`reason: 'profile-not-managed'`) with the diff attached.
+   *
+   * @param options - `signal` cancels the fetch.
+   * @returns a report: what was fetched, what changed, and what was refused.
+   */
+  const performModelSync = async (options = {}) => {
+    const signal = options.signal;
+    const aborted = () => disposed || signal?.aborted;
+    const cancelledReport = () => ({ ok: false, code: 'ABORTED', detail: '拉取模型列表被取消' });
+    if (aborted()) return cancelledReport();
+    const store = credentials();
+    if (store === void 0) return { ok: false, code: 'NO_CREDENTIAL_STORE', detail: '没有挂载凭据服务，无法读取 ChatGPT 凭据。' };
+    if (!settings.manageModels) return { ok: false, code: 'DISABLED', detail: 'manageModels 已关闭：模型列表交给 llm-pi-ai 的已安装目录。' };
+    const record = await store.readRecord(RECORD_KEY);
+    if (record === undefined || record.kind !== 'grant') {
+      return { ok: false, code: 'NO_CREDENTIAL', detail: '还没有保存 ChatGPT 凭据，无法查询这个账号能用的模型。' };
+    }
+    // A catalog is account-scoped. A sign-out/sign-in or another grant refresh
+    // while the network is pending invalidates this operation, not just its token.
+    let credentialImage = stableImage(record);
+    const credentialUnchanged = async () => stableImage(await store.readRecord(RECORD_KEY)) === credentialImage;
+    const credentialChangedReport = () => ({ ok: false, code: 'CREDENTIAL_CHANGED', detail: '查询期间 ChatGPT 凭据已改变，已丢弃这次模型列表；请重新查询。' });
+    let access = typeof record.payload?.access === 'string' ? record.payload.access : '';
+    let accountId = typeof record.payload?.accountId === 'string' ? record.payload.accountId : '';
+    if (access === '' || accountId === '') {
+      return { ok: false, code: 'BAD_RECORD', detail: '凭据记录里没有 access token 或账号 id。' };
+    }
+
+    const stored = readStoredProfile();
+    if (stored.error !== undefined) return { ok: false, code: 'NO_SETTINGS', detail: stored.error };
+
+    const clientVersion = resolveClientVersion({
+      clientVersion: settings.modelsClientVersion,
+      cache: readCodexModelsCache(),
+    });
+    if (aborted()) return cancelledReport();
+    let fetched = await fetchCodexModels({ access, accountId, clientVersion, signal });
+    if (aborted()) return cancelledReport();
+
+    // A 401 here is the same fact the probe reports: the stored access token can
+    // be dead while its `exp` is days away. Refresh once and ask again, which is
+    // what keeps a background sync from silently doing nothing for days.
+    let refreshedBy = undefined;
+    if (fetched.ok !== true && fetched.code === 'UNAUTHORIZED' && typeof record.payload?.refresh === 'string') {
+      const refreshed = await refreshGrant(record.payload.refresh, signal, settings.proxy);
+      if (aborted()) return cancelledReport();
+      if (refreshed.error === undefined) {
+        const nextRecord = {
+          kind: 'grant',
+          payload: {
+            type: 'oauth',
+            access: refreshed.access,
+            refresh: refreshed.refresh,
+            expires: refreshed.expires,
+            accountId: refreshed.accountId,
+          },
+        };
+        let committed = false;
+        await store.modifyRecord(RECORD_KEY, async (current) => {
+          // Compare inside the store's atomic mutation, not before acquiring it:
+          // logout or account B must never be replaced by account A's refresh.
+          if (aborted() || stableImage(current) !== credentialImage) return undefined;
+          committed = true;
+          return nextRecord;
+        });
+        if (aborted()) return cancelledReport();
+        if (!committed) return credentialChangedReport();
+        credentialImage = stableImage(nextRecord);
+        access = refreshed.access;
+        accountId = refreshed.accountId;
+        if (aborted()) return cancelledReport();
+        fetched = await fetchCodexModels({ access, accountId, clientVersion, signal });
+        refreshedBy = 'refresh';
       }
-      try {
-        await service.mutate(SETTINGS_NS, [{ op: 'set', path: ['providers', PROVIDER], value: routeProfile() }], descriptor.revision);
-        return { changed: true, reason: 'upgraded' };
-      } catch (error) {
-        return { changed: false, reason: `mutate failed: ${error && error.message ? error.message : String(error)}` };
-      }
     }
-    try {
-      await service.mutate(SETTINGS_NS, [{ op: 'set', path: ['providers', PROVIDER], value: routeProfile() }], descriptor.revision);
-      return { changed: true, reason: 'added' };
-    } catch (error) {
-      return { changed: false, reason: `mutate failed: ${error && error.message ? error.message : String(error)}` };
+    if (aborted()) return cancelledReport();
+    if (fetched.ok !== true) return { ok: false, ...fetched };
+    if (!await credentialUnchanged()) return credentialChangedReport();
+
+    const generated = toModelEntries(fetched.catalog);
+    if (generated.models.length === 0) {
+      // Writing an empty list would delete the route's whole catalog; reporting
+      // it is the only safe outcome.
+      return { ok: false, code: 'EMPTY_CATALOG', detail: `模型列表没有可用的条目（跳过 ${generated.skipped.length} 条）。`, skipped: generated.skipped };
     }
+    const report = {
+      ok: true,
+      clientVersion,
+      ...(refreshedBy === undefined ? {} : { refreshedBy }),
+      fetched: generated.models.length,
+      skipped: generated.skipped,
+      applied: false,
+      reason: 'unchanged',
+    };
+
+    /**
+     * Record the successful fetch, so the boot pass leaves the network alone
+     * until `modelsRefreshHours` passes. Written for a refused write too: asking
+     * the service again ten seconds later yields the same refusal, and hammering
+     * it is worse than a stale "last checked" time.
+     */
+    const settle = async () => {
+      await writeModelsCache({ clientVersion, etag: fetched.etag, fetchedAt: Date.now(), digest: modelsDigest(generated.models) });
+    };
+
+    const written = await writeProviderProfile((latest) => {
+      const current = latest.written;
+      const currentModels = Array.isArray(current?.models) ? current.models : [];
+      // Recompute the report too: a user's in-flight narrowing is the list that
+      // matters now, not the one read before the network request.
+      const details = currentModels.length === 0 ? {} : { diff: diffModels(currentModels, generated.models) };
+      if (latest.configured && !latest.managed) return { reason: 'profile-not-managed', details };
+      if (latest.configured && sameModels(currentModels, generated.models)) return { reason: 'unchanged', details };
+      return { value: routeProfile(generated.models), reason: latest.configured ? 'models-updated' : 'route-added',
+        details: { ...details, ...(currentModels.length === 0 ? { firstSync: true } : {}), digest: modelsDigest(generated.models) } };
+    }, signal, credentialUnchanged);
+    if (aborted() || written.reason === 'aborted') return cancelledReport();
+    if (written.reason === 'credential-changed') return credentialChangedReport();
+    if (!written.ok) return { ...report, ok: false, code: 'WRITE_FAILED', detail: written.reason };
+    await settle();
+    return { ...report, ...written.details, applied: written.changed === true, reason: written.reason };
+  };
+
+  // Boot, timer, HTTP and tool callers share one network operation. Unload
+  // cancels it even if fetch (or a test double) resolves after aborting.
+  let modelSyncPending;
+  const syncModels = (options = {}) => {
+    if (modelSyncPending !== undefined) return modelSyncPending;
+    const signal = options.signal ? AbortSignal.any([lifetime.signal, options.signal]) : lifetime.signal;
+    modelSyncPending = performModelSync({ signal }).finally(() => { modelSyncPending = undefined; });
+    return modelSyncPending;
   };
 
   // ---------------------------------------------------------------- status ---
@@ -570,22 +923,28 @@ export function apply(ctx, rawConfig) {
     let route = { configured: false };
     const service = settingsService();
     if (service !== void 0) {
-      try {
-        const descriptor = service.describe().find((row) => row.ns === SETTINGS_NS);
-        const providers = descriptor?.value?.providers;
-        const profile = providers?.[PROVIDER];
+      const stored = readStoredProfile();
+      if (stored.error === undefined) {
+        const written = stored.written;
         route = {
-          configured: Boolean(providers && Object.hasOwn(providers, PROVIDER)),
+          configured: stored.configured === true,
           // Whether this route will actually recover from the malformed
           // tool-argument response a reused stream slot produces.
-          retriesMalformed: profile?.retryPolicy?.retryableCodes?.includes?.('MALFORMED_RESPONSE') === true,
+          retriesMalformed: stored.profile?.retryPolicy?.retryableCodes?.includes?.('MALFORMED_RESPONSE') === true,
+          // Whether the served model list is one this plugin manages, or a list
+          // the user pinned by hand (which is then never overwritten). Read from
+          // the written section: `value` carries schema defaults, so it cannot
+          // distinguish "no list" from "a list of zero entries".
+          ...(stored.configured === true ? { modelsManaged: stored.managed } : {}),
+          ...(Array.isArray(written?.models) ? { modelCount: written.models.length } : {}),
         };
-      } catch {
-        route = { configured: false, error: 'cannot read settings' };
+      } else {
+        route = { configured: false, error: stored.error };
       }
     }
 
     const authorization = ctx.get('authorization');
+    const cache = readModelsCache();
     return {
       ok: true,
       provider: PROVIDER,
@@ -593,6 +952,16 @@ export function apply(ctx, rawConfig) {
       credential: describeRecord(record),
       codexCli,
       route,
+      // What the model-list machinery is doing, and how stale its last answer is.
+      models: {
+        managed: settings.manageModels,
+        autoRefresh: settings.autoRefreshModels,
+        refreshHours: settings.modelsRefreshHours,
+        clientVersion: resolveClientVersion({ clientVersion: settings.modelsClientVersion, cache: readCodexModelsCache() }),
+        ...(modelsCacheAge(cache) === undefined ? {} : { lastSyncAt: cache.fetchedAt, ageSeconds: Math.round(modelsCacheAge(cache) / 1000) }),
+        ...(typeof cache?.digest === 'string' ? { digest: cache.digest } : {}),
+        cachePath: modelsCacheFile(),
+      },
       flowAvailable: authorization?.describe?.(RECORD_KEY) !== undefined,
     };
   };
@@ -819,6 +1188,27 @@ export function apply(ctx, rawConfig) {
             );
           }
           lines.push(`- 浏览器 OAuth 流：${value.flowAvailable ? '已注册，可在面板发起' : '未注册'}`);
+          // The served model list, and whether this plugin is the one keeping it
+          // current. Without this line a missing new model reads as a broken
+          // login rather than as a stale catalog.
+          const models = value.models;
+          if (models !== undefined) {
+            const sync = models.lastSyncAt === undefined
+              ? '从未同步过（调用 gpt_models 拉一次）'
+              : `${Math.round((models.ageSeconds ?? 0) / 60)} 分钟前同步（client_version ${models.clientVersion}）`;
+            lines.push(`- 模型列表：${models.managed ? '由本插件维护' : '交给已安装的 pi-ai 目录'}；${sync}`);
+            const route2 = value.route ?? {};
+            if (route2.configured && route2.modelsManaged === false) {
+              lines.push('  → route 含手写或继承配置，插件不会覆盖；需由配置所有者确认后交回管理。');
+            } else if (route2.modelCount !== undefined) {
+              lines.push(`  → 当前 route 供 ${route2.modelCount} 个模型。`);
+            }
+            if (models.managed && models.autoRefresh === true) {
+              lines.push(`  → 启动时及每 ${models.refreshHours} 小时自动检查一次（autoRefreshModels）。`);
+            } else {
+              lines.push(models.managed ? '  → 自动检查已关闭，只在调用 gpt_models 时更新。' : '  → 模型同步已关闭（manageModels:false），保留现有列表。');
+            }
+          }
           const probe = value.probe;
           if (probe !== undefined) {
             lines.push(
@@ -925,6 +1315,50 @@ export function apply(ctx, rawConfig) {
           return { ok: true };
         } catch (error) {
           return { ok: false, error: typeof error?.message === 'string' ? error.message : String(error) };
+        }
+      },
+    });
+    register({
+      name: 'gpt_models',
+      description:
+        '拉取这个 ChatGPT 账号实际能用的 GPT 模型列表，写进 llm-pi-ai 的 openai-codex route，让模型选择器里的列表保持最新。'
+        + '已安装的 pi-ai 目录是打包时的快照：新发布的模型不会自己出现，已下线的模型仍会留在选择器里（选中会报 model_not_found）。'
+        + '这个工具向 Codex 的模型接口取权威列表（含上下文窗口与推理档位），合并进 route；route 里手写的 models 不会被覆盖。'
+        + ' 想知道"为什么新模型看不到"或刚发布新模型时调用。',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: {
+        schema: { type: 'object', properties: {}, additionalProperties: true },
+        render: (_args, value) => {
+          if (value.ok !== true) {
+            return [{ type: 'text', text: `模型列表没更新：${value.detail ?? value.code ?? '未知原因'}` }];
+          }
+          const diff = value.diff ?? {};
+          const lines = [`已向 Codex 查询模型列表（client_version ${value.clientVersion}），服务端返回 ${value.fetched} 个可用模型。`];
+          if (value.firstSync === true) {
+            lines.push('- 首次同步：route 之前没有显式模型列表，现在按服务端列表建好了。');
+          } else {
+            if (diff.added?.length > 0) lines.push(`- 新增：${diff.added.join(', ')}`);
+            if (diff.removed?.length > 0) lines.push(`- 移除（服务端已不提供）：${diff.removed.join(', ')}`);
+            if (diff.changed?.length > 0) lines.push(`- 元数据变化：${diff.changed.join(', ')}`);
+          }
+          if (value.applied === true) {
+            lines.push(value.reason === 'route-added' ? '- 已写入：route 之前不存在，已按服务端列表建好。' : '- 已写入：模型选择器现在就能看到这个列表。');
+          } else if (value.reason === 'profile-not-managed') {
+            lines.push('- 未写入：route 含手写、改过或继承的配置，不属于本插件管理；保留原配置。');
+          } else if (value.reason === 'unchanged') {
+            lines.push('- 未改动：route 里的列表已经和服务端一致。');
+          } else {
+            lines.push(`- 未写入（${value.reason ?? 'unknown'}）。`);
+          }
+          if (value.refreshedBy === 'refresh') lines.push('- access token 曾被服务端拒绝，已用 refresh token 换新后重试成功。');
+          return [{ type: 'text', text: lines.join('\n') }];
+        },
+      },
+      async execute() {
+        try {
+          return await syncModels({});
+        } catch (error) {
+          return { ok: false, code: 'THREW', detail: typeof error?.message === 'string' ? error.message : String(error) };
         }
       },
     });
@@ -1142,32 +1576,112 @@ export function apply(ctx, rawConfig) {
     sendJson(res, 200, { attempt: browserAttempt?.view ?? lastSettledView });
   });
 
+  route(`${API_PREFIX}/models`, async (req, res) => {
+    if (req.method !== 'GET') return sendJson(res, 405, { error: { message: 'GET only' } });
+    const stored = readStoredProfile();
+    const profile = stored.profile;
+    const cache = readModelsCache();
+    sendJson(res, 200, {
+      ok: true,
+      managed: settings.manageModels,
+      autoRefresh: settings.autoRefreshModels,
+      refreshHours: settings.modelsRefreshHours,
+      clientVersion: resolveClientVersion({ clientVersion: settings.modelsClientVersion, cache: readCodexModelsCache() }),
+      cachePath: modelsCacheFile(),
+      ...(modelsCacheAge(cache) === undefined ? {} : { lastSyncAt: cache.fetchedAt, ageSeconds: Math.round(modelsCacheAge(cache) / 1000) }),
+      route: {
+        configured: profile !== undefined,
+        ...(profile === undefined ? {} : { managed: stored.managed }),
+        models: Array.isArray(profile?.models)
+          ? profile.models.map((entry) => ({ id: entry.id, name: entry.name, contextWindow: entry.contextWindow }))
+          : [],
+      },
+    });
+  });
+
+  /**
+   * Refresh the served model list from the Codex models endpoint.
+   *
+   * The reason this is an explicit route and not only a boot task: the fetch
+   * needs the network, may
+   * fail, and reports a diff a person wants to read.
+   */
+  route(`${API_PREFIX}/models/refresh`, async (req, res) => {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'POST only' } });
+    const report = await syncModels({});
+    sendJson(res, 200, report);
+  });
+
   route(`${API_PREFIX}/route/enable`, async (req, res) => {
     if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'POST only' } });
     sendJson(res, 200, { ok: true, ...(await ensureRoute()) });
   });
 
   // A stored credential with no route serves nothing; make the common case work
-  // without the user having to know that these are two separate facts.
-  if (settings.autoEnableRoute) {
+  // without the user having to know that these are two separate facts. The same
+  // boot pass is what keeps the model list current: pi-ai's catalog is frozen at
+  // build time, so without this a new model would never appear in the picker.
+  if (settings.autoEnableRoute || (settings.manageModels && settings.autoRefreshModels)) {
     ctx.effect(() => {
       let cancelled = false;
+      let timer;
+      const refreshMs = settings.modelsRefreshHours * 3600 * 1000;
+      const schedule = () => {
+        if (cancelled || disposed || !settings.manageModels || !settings.autoRefreshModels) return;
+        const age = modelsCacheAge();
+        // Cache-aware scheduling avoids waiting a full period after restarting.
+        // Failed checks retry after one period, never in a tight stale-cache loop.
+        const delay = age === undefined || age >= refreshMs ? refreshMs : refreshMs - age;
+        timer = setTimeout(() => run().finally(schedule), Math.min(delay, 2147483647));
+        timer.unref?.();
+      };
       const run = async () => {
         const store = credentials();
         if (store === void 0) return;
+        let record;
         try {
-          const record = await store.readRecord(RECORD_KEY);
-          if (cancelled || record === undefined) return;
-          await ensureRoute();
+          record = await store.readRecord(RECORD_KEY);
         } catch (error) {
-          console.warn('[dsh-gpt-codex] could not enable the openai-codex route:', error && error.message ? error.message : error);
+          console.warn('[dsh-gpt-codex] could not read the stored credential:', error && error.message ? error.message : error);
+          return;
+        }
+        if (cancelled || disposed || record === undefined) return;
+
+        if (settings.autoEnableRoute) {
+          try {
+            await ensureRoute();
+          } catch (error) {
+            console.warn('[dsh-gpt-codex] could not enable the openai-codex route:', error && error.message ? error.message : error);
+          }
+        }
+
+        if (!settings.manageModels || !settings.autoRefreshModels || cancelled) return;
+        // Respect the cache: a desktop app restart is not a reason to re-fetch a
+        // list that is an hour old, and the endpoint is a live service.
+        const age = modelsCacheAge();
+        if (age !== undefined && age < settings.modelsRefreshHours * 3600 * 1000) return;
+        try {
+          const report = await syncModels({});
+          if (cancelled) return;
+          if (report.applied === true) {
+            const added = report.diff?.added ?? [];
+            const removed = report.diff?.removed ?? [];
+            console.info(
+              `[dsh-gpt-codex] 模型列表已更新（${report.fetched} 个模型`
+              + `${added.length > 0 ? `；新增 ${added.join(', ')}` : ''}`
+              + `${removed.length > 0 ? `；移除 ${removed.join(', ')}` : ''}）`,
+            );
+          }
+        } catch (error) {
+          console.warn('[dsh-gpt-codex] could not refresh the model list:', error && error.message ? error.message : error);
         }
       };
-      void run();
+      void run().finally(schedule);
       return () => {
         cancelled = true;
+        clearTimeout(timer);
       };
-    }, 'dsh-gpt-codex: enable route when a credential exists');
+    }, 'dsh-gpt-codex: enable route and periodically refresh models when a credential exists');
   }
 
   if (settings.proxy !== undefined) {

@@ -28,6 +28,28 @@
 #                      retries). Recovers the turn when a response's tool
 #                      arguments cannot be parsed at all. Set false to keep the
 #                      route profile at `transport` only.
+# manageModels:        keep the route's model list in step with what the plan
+#                      serves, by asking the Codex models endpoint and writing
+#                      the result into the `openai-codex` profile. Needed because
+#                      pi-ai ships its catalog as a file inside the application:
+#                      a model released after the build never appears, and a
+#                      retired one keeps failing with `model_not_found`. Only a
+#                      list this plugin generated (marked by `modelsDigest`) is
+#                      ever rewritten; a hand-written list is left alone and the
+#                      drift is reported instead. Set false to inherit the
+#                      existing list (or installed catalog) and never touch `models`.
+# autoRefreshModels:   check at startup and periodically while the Host is loaded,
+#                      fetching when the cache reaches `modelsRefreshHours`
+#                      (default 24). Failures retain the old list and retry after
+#                      one period; unload clears the timer and aborts the fetch.
+#                      Set false to refresh
+#                      only through the "更新模型列表" button, POST
+#                      /gpt-codex/models/refresh, or the `gpt_models` tool.
+# modelsRefreshHours:  minimum hours between automatic syncs. Default 24.
+# modelsClientVersion: pin the `client_version` the models endpoint gates its
+#                      answer on. Empty means use the version this machine's
+#                      Codex CLI last negotiated ($CODEX_HOME/models_cache.json),
+#                      then this plugin's own fallback.
 
 - insert:
     - id: gpt-codex
@@ -38,3 +60,7 @@
         autoEnableRoute: true
         retryMalformedResponses: true
         endpoints: []
+        manageModels: true
+        autoRefreshModels: true
+        modelsRefreshHours: 24
+        modelsClientVersion: ''

@@ -44,6 +44,20 @@ window.__ModuleLoader__.load({
       return `${date.toLocaleString()}（${date.getTime() > Date.now() ? '有效' : '已过期'}）`;
     };
 
+    /**
+     * A coarse age ("3 分钟", "2 小时"), for a cache timestamp.
+     *
+     * Deliberately not an exact timestamp: what the reader needs to know is
+     * whether the model list was checked recently enough to trust.
+     */
+    const formatAge = (seconds) => {
+      if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return '—';
+      if (seconds < 90) return '刚刚';
+      if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟`;
+      if (seconds < 86400) return `${Math.round(seconds / 3600)} 小时`;
+      return `${Math.round(seconds / 86400)} 天`;
+    };
+
     const styles = {
       page: {
         padding: '24px 28px',
@@ -131,6 +145,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState('');
       const [error, setError] = React.useState('');
       const [message, setMessage] = React.useState('');
+      const [messageTone, setMessageTone] = React.useState('success');
       const [attempt, setAttempt] = React.useState(undefined);
       const [answer, setAnswer] = React.useState('');
       const [probe, setProbe] = React.useState(undefined);
@@ -181,7 +196,8 @@ window.__ModuleLoader__.load({
         setMessage('');
         try {
           const result = await action();
-          setMessage(result);
+          setMessage(typeof result === 'string' ? result : result.text);
+          setMessageTone(typeof result === 'string' ? 'success' : result.tone);
           await refresh();
         } catch (failure) {
           setError(failure.message);
@@ -239,6 +255,33 @@ window.__ModuleLoader__.load({
         });
 
       /**
+       * Ask the Host to re-read the model list from the Codex endpoint.
+       *
+       * The installed pi-ai catalog is a build-time snapshot. This manual check
+       * complements the Host's startup and periodic checks for OAuth routes.
+       */
+      const refreshModels = () =>
+        run('models', async () => {
+          const result = await call('/models/refresh', { method: 'POST', body: {} });
+          if (result.ok !== true) throw new Error(`模型列表未更新 —— ${result.detail ?? result.code ?? '未知原因'}`);
+          if (result.reason === 'profile-not-managed') {
+            return { text: `已查到 ${result.fetched} 个模型；route 为自定义或继承配置，已保留，没有覆盖。`, tone: 'neutral' };
+          }
+          if (result.applied === true) {
+            const change = result.firstSync === true
+              ? '首次同步。'
+              : [
+                  ['added', '新增'],
+                  ['removed', '移除'],
+                  ['changed', '更新参数'],
+                ].map(([key, label]) => result.diff?.[key]?.length > 0 ? ` ${label} ${result.diff[key].join('、')}。` : '').join('');
+            return `已拉取 ${result.fetched} 个模型并写入 route。${change}`;
+          }
+          if (result.reason === 'unchanged') return `已检查，route 里的模型列表已是最新（${result.fetched} 个）。`;
+          return { text: `已查到 ${result.fetched} 个模型，但未写入 route（${result.reason ?? '未知原因'}）。`, tone: 'neutral' };
+        });
+
+      /**
        * Ask the Host to send one real request. "Configured" is not "working":
        * a stored token can be revoked while its `exp` is still days away.
        */
@@ -266,6 +309,23 @@ window.__ModuleLoader__.load({
       const credential = status.credential ?? {};
       const cli = status.codexCli ?? {};
       const route = status.route ?? {};
+      const models = status.models ?? {};
+      // An omitted list inherits the installed catalog; it is not an empty list.
+      const hasModelCount = Number.isInteger(route.modelCount) && route.modelCount >= 0;
+      const modelSource = hasModelCount
+        ? `${route.modelCount} 个模型${route.modelsManaged === false ? '（自定义/继承配置，保留）' : ''}`
+        : route.configured ? '沿用已安装模型目录（数量未知）' : 'route 未启用';
+      const age = formatAge(models.ageSeconds);
+      const lastCheck = models.lastSyncAt === undefined
+        ? '尚未检查'
+        : age === '刚刚' ? '刚刚检查' : age === '—' ? '已检查（时间未知）' : `${age}前检查`;
+      const autoRefresh = models.managed === false
+        ? '已关闭模型管理；保留现有列表'
+        : models.autoRefresh === false
+          ? '自动更新已关闭；可手动更新'
+          : models.managed === true && models.autoRefresh === true
+            ? `启动时及每 ${models.refreshHours} 小时检查${!credential.configured ? ' · 等待登录' : ''}${route.modelsManaged === false ? ' · 自定义/继承配置不会覆盖' : ''}`
+            : '自动更新状态未知';
       const attemptPhase = attempt?.phase ?? 'idle';
       const question = attempt?.question;
 
@@ -333,6 +393,18 @@ window.__ModuleLoader__.load({
             : null,
           React.createElement(
             Row,
+            { label: '模型列表' },
+            React.createElement(
+              'span',
+              null,
+              modelSource,
+              ` · ${lastCheck}`,
+              `（client_version ${models.clientVersion ?? '—'}）`,
+            ),
+          ),
+          React.createElement(Row, { label: '模型自动更新' }, autoRefresh),
+          React.createElement(
+            Row,
             { label: '浏览器 OAuth' },
             status.flowAvailable ? '已注册，可在此发起' : '未注册（确认 llm-pi-ai 已加载）',
           ),
@@ -372,6 +444,19 @@ window.__ModuleLoader__.load({
             credential.configured
               ? React.createElement(
                   'button',
+                  {
+                    type: 'button',
+                    style: styles.button,
+                    disabled: busy !== '',
+                    onClick: refreshModels,
+                    title: '向 Codex 查询当前可用的模型并写入 route；自定义或继承的 route 配置不会被覆盖',
+                  },
+                  busy === 'models' ? '拉取中…' : '更新模型列表',
+                )
+              : null,
+            credential.configured
+              ? React.createElement(
+                  'button',
                   { type: 'button', style: styles.button, disabled: busy !== '', onClick: () => verify(false) },
                   busy === 'verify' ? '验证中…' : '验证能否用',
                 )
@@ -402,8 +487,8 @@ window.__ModuleLoader__.load({
                   `${probe.ok === true ? '通过' : '失败'} —— ${probe.detail}`,
                 ),
               ),
-          error === '' ? null : React.createElement('p', { style: styles.error }, error),
-          message === '' ? null : React.createElement('p', { style: styles.ok }, message),
+          error === '' ? null : React.createElement('p', { role: 'alert', style: styles.error }, error),
+          message === '' ? null : React.createElement('p', { role: 'status', style: messageTone === 'neutral' ? styles.hint : styles.ok }, message),
         ),
 
         attemptPhase === 'idle'

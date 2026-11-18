@@ -30,6 +30,15 @@ function assertLosslessJson(value, where = '$', seen = new Set()) {
 }
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'gpt-codex-json-'));
+// Keep the plugin's own state file (`$DSH_HOME/gpt-codex-models.json`) out of the
+// developer's real harness home, and stamp it fresh so the boot pass does not
+// spend the network calls these cases count.
+process.env.DSH_HOME = path.join(tmp, 'dsh-home');
+await fs.mkdir(process.env.DSH_HOME, { recursive: true });
+await fs.writeFile(
+  path.join(process.env.DSH_HOME, 'gpt-codex-models.json'),
+  JSON.stringify({ version: 1, clientVersion: '0.169.0', fetchedAt: Date.now(), digest: 'seeded' }),
+);
 const realFetch = globalThis.fetch;
 const accountId = 'fixture-account';
 const claim = 'https://api.openai.com/auth';

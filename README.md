@@ -9,11 +9,11 @@
 | 已原生具备 | 位置 |
 |---|---|
 | pi-ai 适配器（dormant，零 route） | `@deepseek-ai/dsh-llm-pi-ai`，随 `dsh-base` 挂载 |
-| `openai-codex` provider，`https://chatgpt.com/backend-api`，9 个 chat 模型 | `@earendil-works/pi-ai` 1.1.0 |
+| `openai-codex` provider，`https://chatgpt.com/backend-api`，打包时写死的模型目录 | `@earendil-works/pi-ai` 1.3.0 |
 | ChatGPT OAuth 授权流（`llm-pi-ai/openai-codex`） | `dsh-llm-pi-ai` 的 `registerPiAiFlows` |
 | 凭据落盘与跨进程刷新 | `dsh-credentials-local` → `~/.dsh/.credentials.yaml` |
 
-**缺的只有两件事**，也正是本插件的全部内容：
+**缺的是两件事**，也正是本插件最初的全部内容（0.3.0 起多了第三件：把模型列表跟上游对齐）：
 
 1. **没人能触发那条 OAuth 流。** 全应用里 `authorization.begin()` 的唯一调用方是 DeepSeek 账号插件；Models 页面对 `openai-codex`（`env: []` + `oauth: true` 的 keyless native auth）**连 API key 输入框都不渲染**，`settings.models.sign-in` 又被 DeepSeek 首次引导占着。所以界面上根本没有登录入口。
 2. **`llm-pi-ai` 没有 `openai-codex` 这条 route**，即使有凭据也不服务任何模型。
@@ -25,7 +25,7 @@
 ```bash
 git clone https://github.com/bhjia-phys/dsh-gpt-codex.git
 cd dsh-gpt-codex
-npm test          # 96 项检查 + 本机代理回归，不访问外网、不碰真实凭据
+npm test          # 150 项检查 + 本机代理回归，不访问外网、不碰真实凭据
 ```
 
 安装到某个 DSH profile（以 `desktop` 为例）：
@@ -101,13 +101,14 @@ npm test          # 96 项检查 + 本机代理回归，不访问外网、不碰
 
 ## Agent 工具
 
-模型自己也能操作这三件事：
+模型自己也能操作这四件事：
 
 | 工具 | 作用 |
 |---|---|
-| `gpt_status` | 凭据、Codex CLI 可复用性、route 状态，默认发一次真实请求确认可用（`verify: false` 可跳过） |
+| `gpt_status` | 凭据、Codex CLI 可复用性、route 状态、模型列表维护状态，默认发一次真实请求确认可用（`verify: false` 可跳过） |
 | `gpt_sign_in` | `mode: 'codex-cli'`（默认）桥接；`mode: 'browser'` 会如实拒绝，因为需要人工交互 |
 | `gpt_sign_out` | 删除本机记录（不向 OpenAI 撤销，也不动 Codex CLI 自己的登录） |
+| `gpt_models` | 向 Codex 查这个账号能用的模型，写进 route（见「模型列表为什么不会自己更新」） |
 
 工具直接返回纯 JSON：未知的 `planType`、`authMode`、凭据字段及不存在的 `bridgeError` 会被结构化省略，而不是返回 `undefined`；`verify: false` 不含 `probe`。时间戳只输出有限数值；异常 JWT/刷新响应的到期值沿用缺少到期值时的当前时间回退，已存记录中的非有限到期值不输出。工具边界不靠 `JSON.stringify` 静默清理非法值。
 
@@ -118,6 +119,8 @@ npm test          # 96 项检查 + 本机代理回归，不访问外网、不碰
 ```
 GET  /gpt-codex/status
 GET  /gpt-codex/stream-repair          # 修复安装了哪些端点、改写过多少条事件
+GET  /gpt-codex/models                 # route 现在供哪些模型、列表归谁维护
+POST /gpt-codex/models/refresh         # 向 Codex 重拉模型列表并写入 route
 POST /gpt-codex/sign-in        { mode: 'codex-cli' }
 POST /gpt-codex/sign-out
 POST /gpt-codex/oauth/start
@@ -126,6 +129,77 @@ POST /gpt-codex/oauth/cancel
 GET  /gpt-codex/oauth/state
 POST /gpt-codex/route/enable
 ```
+
+## 模型列表为什么不会自己更新（以及 0.3.0 怎么修）
+
+**症状**：GPT 明明发布了新模型，选择器里没有；已经下线的模型却还在，选中就报
+`model_not_found`。2026-11-17 实测：已安装的 pi-ai 1.3.0 目录里有 9 个模型，其中
+`gpt-5.3-codex-spark` 和 `gpt-5.5` 后端已经拒绝（`not supported when using Codex with a
+ChatGPT account`），而当时正在服务的 `gpt-6.2-sol`、`gpt-6.2-astra`、`gpt-6.1-terra`
+一个都不在目录里。
+
+**为什么不会自己更新**，三处原因叠在一起，缺一不可：
+
+1. 模型目录是**打包进应用的一个 JSON 文件**（`pi-ai/dist/providers/data/openai-codex.json`），
+   内容在构建那一刻就定了。app.asar 里的文件不会因为服务端上新而改变。
+2. pi-ai 的 `openai-codex` provider 没有 `fetchModels`，而 `dsh-llm-pi-ai` 的
+   `buildProvider` / `reuseCatalogProvider` 明确**丢掉**了 catalog 自带的动态刷新
+   （注释写得很直白：*this route's catalog is the settings document*）。
+   `discovery.ts` 的 `LISTABLE_PROTOCOLS` 也故意排除了 Codex 这条协议——它走 OAuth，
+   一个天真的 `GET /models` 会把鉴权失败读成「没有模型」。
+3. 插件的 route 只写了 `transport: 'sse'`，不写 `models`，于是**继承**上面那个静态目录。
+   没有任何东西在盯着上游发布。
+
+**权威来源是有的**，Codex CLI 自己就用它：
+
+```
+GET https://chatgpt.com/backend-api/codex/models?client_version=<x.y.z>
+Authorization: Bearer <ChatGPT access token>
+ChatGPT-Account-ID: <account id>
+```
+
+`client_version` **必填**（不带直接 400），而且它会**过滤结果**：旧版本看到更少的模型
+（实测 0.150.0 → 5 个，0.160.0 → 10 个，0.169.0 → 12 个）。返回里每条带
+`slug`、`display_name`、`context_window`、`input_modalities`、
+`supported_reasoning_levels`、`visibility`（`list` / `hide`）。
+
+**0.3.0 的做法**（`models.js` + route 的 `models` 字段）：
+
+- 插件向上面这个接口要列表，只取 `visibility: "list"` 的行（`gpt-reserve`、
+  `codex-auto-review` 是内部路由的隐藏行，不该出现在选择器里），映射成 route 的
+  `models` 条目：`name` / `contextWindow` / `input`（`audio` 丢掉，harness 没有这个模态）/
+  `reasoningEfforts`。
+- 服务端列的 `ultra` 档位 pi-ai 没有对应名字（最高是 `max`），**丢掉而不是硬塞给
+  `max`**——否则选择器会给出一个请求时必然失败的档位。
+- `reasoningEfforts` **刻意不写 `off`**。实测这条链只在一种写法下能跑通：profile 省略
+  `off` → 解析器把它钉成 `null` → pi-ai 的 Codex 构造器看到 `map.off === null` 就
+  不发 reasoning 块。若写成 `off: 'none'` 或让 `off` 出现在 map 里，pi-ai 会发
+  `{"effort":"none"}`，而 `gpt-6.x` 直接回 400
+  （`Unsupported value: 'none' is not supported with the 'gpt-6.2-sol' model`）。
+- 写进去的 route 额外带一个 `modelsDigest`（内容指纹）。**只有指纹对得上的列表才会被
+  覆盖**：手写/改过的 `models`（钉版本、只留几个、改过某个字段）永远不动，插件只在
+  `gpt_status` / `gpt_models` 里报告「服务端多了什么、少了什么」。
+- 自动更新：启动时检查缓存；过期时拉取，**Host 持续运行期间也会定时检查**，默认每
+  `modelsRefreshHours: 24` 小时一次，无需重启。用 `$DSH_HOME/gpt-codex-models.json`
+  记上次成功查询的时间，缓存还新时等到到期再查；失败保留旧列表，间隔后重试。
+  手动和自动查询共享一次进行中的请求；卸载会清理定时器并取消未完成的网络请求。
+  关掉定时查询用 `autoRefreshModels: false`，禁用模型同步用 `manageModels: false`
+  （保留已有列表，不会自动删掉已写的 `models`）。
+- 配置保护：归属判断看 settings 的原始 `user`，不拿带 schema 默认值的 `value` 来比较。
+  有继承的 provider、手写 transport/retry/headers，或条目内新增的 `maxTokens` / `compat`
+  都不覆盖；网络请求期间的编辑、revision 冲突也会重新检查。查询期间登出、切换账号或
+  凭据改变，会丢弃旧账号的结果；401 刷新只原子替换仍是原来的授权记录，不会复活已登出的账号。
+- 手动更新：面板「更新模型列表」按钮、`POST /gpt-codex/models/refresh`、`gpt_models` 工具。
+- 服务端返回空列表时**拒绝写入**——写一个空 `models` 等于把整条 route 的目录删掉。
+
+**为什么不用 `modelOverrides`**：它只能修改**已安装目录里已存在**的 id，对
+`gpt-6.2-sol` 直接报错（`modelOverrides names "gpt-6.2-sol", which the installed catalog
+does not describe`）。要走这条路就得先改 pi-ai 的目录文件，而它在 app.asar 里。
+
+**为什么不改成把 pi-ai 升到 1.5.2**：1.5.2（2026-11-10）的目录里有 8 个模型，含
+`gpt-6.1-terra` 但**没有** `gpt-6.2-*`；`gpt-6.2-astra/sol` 只在 pi-ai 的 git `main` 上
+（CHANGELOG 还挂在 Unreleased）。升依赖只能追到上一代，而且下次上新还得再升一次——
+这正是这次要解决的问题本身。
 
 ## 为什么 route 走 settings 而不是 bundle patch
 
@@ -213,12 +287,18 @@ MALFORMED_RESPONSE
         autoEnableRoute: true          # 已有凭据时自动补上 openai-codex route
         retryMalformedResponses: true  # route 的重试码加上 MALFORMED_RESPONSE
         endpoints: []                  # 中转站的流式端点（见上一节）
+        manageModels: true             # 用服务端的模型列表维护 route 的 models
+        autoRefreshModels: true        # 启动及持续运行中定时检查缓存，到期拉取
+        modelsRefreshHours: 24
+        modelsClientVersion: ''        # 空 = 用本机 Codex CLI 协商过的版本
 ```
 
 ## 测试
 
 ```bash
-node test-host.mjs          # 41 项：桥接、route 启用/升级、OAuth 状态机、工具、路由、客户端包形态、刷新自愈、真实探测
+node test-host.mjs          # 54 项：桥接、route 启用/升级、模型列表同步与归属判定、OAuth 状态机、工具、路由、客户端包形态、刷新自愈、真实探测
+node test-refresh.mjs       # 22 项：真实形态 settings、继承/条目编辑保护、网络/revision/账号竞态、定时更新/错误重试/卸载取消/单飞（假时钟，不等待真实周期）
+node test-models.mjs        # 19 项：服务端列表 → route 条目的映射（ultra/off/隐藏行/无窗口行）、指纹稳定性、diff、拉取的失败形态
 node test-contract.mjs      #  8 项：record 能否通过真实 store 的准入规则；retryPolicy 是否被 schema 接受；与已安装目录交叉验证
 node test-json.mjs          # 31 项：直接 execute/render 的 lossless JSON 边界；成功/失败、缺字段、异常时间戳
 node test-proxy.mjs         # 本地代理回归：先初始化 fetch，再加载插件；检查代理生效、回环绕过与卸载恢复
@@ -237,7 +317,9 @@ node test-stream-repair.mjs # 16 项：用**已安装的 pi-ai** 重放「两个
 - **Codex CLI 那条路只有在 `auth_mode: chatgpt` 时可用**；`auth_mode: apikey` 会被明确拒绝（不会悄悄搬一个错误形状进去）。
 - pi-ai 的 `originator` 头默认是 `"pi"`。若后端策略要求别的值，需要在 pi-ai 上游改，插件层碰不到。
 - **流式修复只覆盖 SSE。** WebSocket 那一路不经过 `fetch`，位置复用问题在那里修不了；插件把 route 钉在 SSE 上，正是为了让它自己的修复有机会生效。
-- **重试是「再花一次订阅额度」。** `retryMalformedResponses` 打开后，一次坏响应会重问最多 2 次；这是刻意的取舍，不是白拿。
+- **重试是「再花一次订阅额度」。** `retryMalformedResponses` 打开后，一次坏响应会重问最多 2 次；这是刻意的取舍，不是白拿。`gpt_models` 只发一次很小的 GET，不消耗生成额度。
+- **模型列表 = 「这个账号现在能看到什么」。** 服务端按 `client_version` 过滤（旧版本看到更少的模型），所以 `modelsClientVersion` 留空时用的是本机 Codex CLI 协商过的版本；某台机器的 Codex 很旧时它看到的列表也会偏少，把它钉到一个已知够新的版本即可。
+- **手写/编辑过的模型列表及继承的 provider 不会被覆盖。** 这是刻意的：宁可让 `gpt_models` 报告差异而列表不动，也不要悄悄改掉你自己钉的列表。若只是手写列表，删掉 `models` 后可重新查询；若还有自定义 route 字段或继承配置，必须先由配置所有者确认如何交回管理。
 
 ## 更多文档
 

@@ -23,6 +23,35 @@ globalThis.fetch = async () => { throw new Error('offline test: no scripted fetc
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'gpt-codex-host-'));
 
+// The plugin keeps two pieces of machine state outside the app: the injected
+// Codex CLI login path (a fixture here) and its own model-fetch cache. Both are
+// redirected into the temp directory so a test run never reads or writes the
+// developer's real state.
+process.env.DSH_HOME = path.join(tmp, 'dsh-home');
+await fsp.mkdir(process.env.DSH_HOME, { recursive: true });
+
+/**
+ * Stamp a model-sync cache that is fresh enough to skip the boot fetch.
+ *
+ * The boot pass refreshes models at most once per `modelsRefreshHours`, so most
+ * cases here should not reach the network at all — exactly like a machine that
+ * synced an hour ago. Cases that exercise the refresh delete this file first.
+ */
+async function seedFreshModelsCache(ageSeconds = 60) {
+  await fsp.writeFile(
+    path.join(process.env.DSH_HOME, 'gpt-codex-models.json'),
+    JSON.stringify({ version: 1, clientVersion: '0.169.0', fetchedAt: Date.now() - ageSeconds * 1000, digest: 'seeded' }),
+    'utf8',
+  );
+}
+
+/** Forget the cache, so the next boot pass performs a real refresh. */
+async function clearModelsCache() {
+  await fsp.rm(path.join(process.env.DSH_HOME, 'gpt-codex-models.json'), { force: true });
+}
+
+await seedFreshModelsCache();
+
 /** ------------------------------------------------------------------ fixtures */
 
 /** Build an unsigned JWT whose payload carries the ChatGPT claims pi-ai reads. */
@@ -101,12 +130,39 @@ function makeCtx(options = {}) {
       if (name === 'settings') {
         return {
           describe() {
+            // The real `SettingsForms.describe()` returns two DIFFERENT views, and
+            // reproducing that difference is the point of this double:
+            //   `value` is the validated profile — every schema default
+            //           materialized, so `models` is always an array (empty when
+            //           the route inherits the installed catalog);
+            //   `user`  is the profile-layer section exactly as written.
+            // A double that returns the written object for both hides the case
+            // where a plugin compares against the wrong one and concludes every
+            // route is foreign.
+            const written = state.providers ?? {};
+            const value = Object.fromEntries(Object.entries(written).map(([provider, profile]) => [provider, {
+              models: [],
+              modelOverrides: {},
+              compat: { chatTemplateKwargs: {}, chatTemplateArgs: {} },
+              defaultContextWindow: 1000000,
+              defaultMaxTokens: 128000,
+              defaultInput: ['text'],
+              headers: {},
+              thinkingBudgets: {},
+              transport: 'sse',
+              streamIdleTimeoutMs: 300000,
+              maxRequestImageBytes: 20971520,
+              maxRequestImages: 50,
+              requestImagePixelBudget: 4194304,
+              requestImageMaxBytes: 1048576,
+              ...profile,
+            }]));
             return [
               {
                 ns: 'llm-pi-ai',
                 revision: state.settingsWrites.length,
-                value: { providers: { ...(state.providers ?? {}) } },
-                user: { providers: { ...(state.providers ?? {}) } },
+                value: { providers: value },
+                user: { providers: { ...written } },
               },
             ];
           },
@@ -1033,6 +1089,309 @@ console.log('dsh-gpt-codex host tests');
   } finally {
     globalThis.fetch = before;
   }
+}
+
+// ---- 30. the models endpoint: the whole point of the change
+//
+// The route must end up with a model list built from the server's answer, not
+// from the installed pi-ai catalog — that catalog is a build-time snapshot, which
+// is why a newly released model never appeared in the picker.
+
+/** A Codex models reply, shaped like the real endpoint's. */
+function modelsReply(rows) {
+  return {
+    status: 200,
+    headers: { 'content-type': 'application/json', etag: 'W/"test"' },
+    body: JSON.stringify({ models: rows }),
+  };
+}
+
+/** One server row. Defaults describe a currently-served model. */
+function modelRow(overrides = {}) {
+  return {
+    slug: 'gpt-6.2-sol',
+    display_name: 'GPT-6.2-Sol',
+    context_window: 500000,
+    input_modalities: ['text', 'image'],
+    supported_reasoning_levels: [{ effort: 'low' }, { effort: 'medium' }, { effort: 'high' }, { effort: 'xhigh' }, { effort: 'max' }, { effort: 'ultra' }],
+    visibility: 'list',
+    supported_in_api: true,
+    ...overrides,
+  };
+}
+
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  apply(ctx, { codexAuthPath: codexAuthFile, autoEnableRoute: false });
+  const net = installFetch([
+    { match: 'chatgpt.com/backend-api/codex/models', reply: modelsReply([modelRow(), modelRow({ slug: 'gpt-6.1-terra', context_window: 500000 })]) },
+  ]);
+  try {
+    const refreshed = await request(state, 'POST', '/gpt-codex/models/refresh', {});
+    await check('POST /models/refresh writes the served list into the route', () => {
+      assert.equal(refreshed.status, 200);
+      assert.equal(refreshed.json.ok, true);
+      assert.equal(refreshed.json.fetched, 2);
+      assert.equal(refreshed.json.applied, true);
+      const written = state.providers['openai-codex'];
+      assert.deepEqual(written.models.map((entry) => entry.id), ['gpt-6.2-sol', 'gpt-6.1-terra']);
+      // The route keeps the transport and retry policy this plugin recommends.
+      assert.equal(written.transport, 'sse');
+      assert.ok(written.retryPolicy.retryableCodes.includes('MALFORMED_RESPONSE'));
+      // And it carries the marker that proves the list is generated.
+      assert.equal(typeof written.modelsDigest, 'string');
+      assert.equal(written.modelsDigest.length, 8);
+      // `client_version` is mandatory on this endpoint: omitting it is a 400.
+      const call = net.calls.find((entry) => entry.url.includes('/codex/models'));
+      assert.ok(call, 'the models endpoint was called');
+      assert.match(call.url, /client_version=\d+\.\d+\.\d+/);
+      assert.equal(call.init.headers.authorization, `Bearer ${accessToken}`);
+      assert.equal(call.init.headers['chatgpt-account-id'], accountId);
+    });
+
+    // A second refresh of the same server answer must not rewrite anything.
+    state.settingsWrites.length = 0;
+    const again = await request(state, 'POST', '/gpt-codex/models/refresh', {});
+    await check('a second refresh of an unchanged catalog writes nothing', () => {
+      assert.equal(again.json.ok, true);
+      assert.equal(again.json.applied, false);
+      assert.equal(again.json.reason, 'unchanged');
+      assert.equal(state.settingsWrites.length, 0);
+    });
+
+    const listed = await request(state, 'GET', '/gpt-codex/models', {});
+    await check('GET /models reports the route list and this plugin owns it', () => {
+      assert.equal(listed.json.route.configured, true);
+      assert.equal(listed.json.route.managed, true);
+      assert.deepEqual(listed.json.route.models.map((entry) => entry.id), ['gpt-6.2-sol', 'gpt-6.1-terra']);
+      assert.equal(listed.json.managed, true);
+    });
+  } finally {
+    net.restore();
+  }
+}
+
+// ---- 31. a hand-written model list is never overwritten, and the drift is reported
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  state.providers = {
+    'openai-codex': {
+      transport: 'sse',
+      models: [{ id: 'gpt-6.1-sol', name: 'GPT-6.1-Sol', contextWindow: 500000 }],
+    },
+  };
+  apply(ctx, { codexAuthPath: codexAuthFile, autoEnableRoute: false });
+  const net = installFetch([
+    { match: 'chatgpt.com/backend-api/codex/models', reply: modelsReply([modelRow()]) },
+  ]);
+  try {
+    const refreshed = await request(state, 'POST', '/gpt-codex/models/refresh', {});
+    await check('a hand-written models list is left alone, with the diff reported', () => {
+      assert.equal(refreshed.json.ok, true);
+      assert.equal(refreshed.json.applied, false);
+      assert.equal(refreshed.json.reason, 'profile-not-managed');
+      assert.deepEqual(refreshed.json.diff.added, ['gpt-6.2-sol']);
+      assert.deepEqual(refreshed.json.diff.removed, ['gpt-6.1-sol']);
+      assert.deepEqual(state.providers['openai-codex'].models.map((entry) => entry.id), ['gpt-6.1-sol']);
+      assert.equal(state.settingsWrites.length, 0);
+    });
+    const tool = state.tools.get('gpt_models');
+    const rendered = tool.output.render({}, refreshed.json);
+    await check('the tool explains why it refused to write', () => {
+      assert.match(rendered[0].text, /手写/);
+      assert.match(rendered[0].text, /gpt-6\.2-sol/);
+    });
+  } finally {
+    net.restore();
+  }
+}
+
+// ---- 32. an edited list stops being mine: a changed entry is respected
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  state.providers = {
+    'openai-codex': {
+      transport: 'sse',
+      // A list the plugin wrote, then the user changed one entry in place.
+      models: [{ id: 'gpt-6.2-sol', name: 'Renamed by hand', contextWindow: 500000, reasoningEfforts: { low: 'low' } }],
+      modelsDigest: '00000000',
+    },
+  };
+  apply(ctx, { codexAuthPath: codexAuthFile, autoEnableRoute: false });
+  const net = installFetch([
+    { match: 'chatgpt.com/backend-api/codex/models', reply: modelsReply([modelRow()]) },
+  ]);
+  try {
+    const refreshed = await request(state, 'POST', '/gpt-codex/models/refresh', {});
+    await check('a stale digest means the list is the user\'s now', () => {
+      assert.equal(refreshed.json.applied, false);
+      assert.equal(refreshed.json.reason, 'profile-not-managed');
+      assert.equal(state.providers['openai-codex'].models[0].name, 'Renamed by hand');
+    });
+  } finally {
+    net.restore();
+  }
+}
+
+// ---- 33. without a credential the refresh reports that, and never calls out
+{
+  const { ctx, state } = makeCtx();
+  apply(ctx, { codexAuthPath: codexAuthFile, autoEnableRoute: false });
+  const net = installFetch([]);
+  try {
+    const refreshed = await request(state, 'POST', '/gpt-codex/models/refresh', {});
+    await check('a refresh with no credential is reported without a network call', () => {
+      assert.equal(refreshed.json.ok, false);
+      assert.equal(refreshed.json.code, 'NO_CREDENTIAL');
+      assert.equal(net.calls.length, 0);
+    });
+  } finally {
+    net.restore();
+  }
+}
+
+// ---- 34. the boot pass refreshes models when the cache is stale, and not when it is fresh
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  await clearModelsCache();
+  const net = installFetch([
+    { match: 'chatgpt.com/backend-api/codex/models', reply: modelsReply([modelRow()]) },
+  ]);
+  apply(ctx, { codexAuthPath: codexAuthFile });
+  try {
+    // The boot pass is async; give it a moment of real time.
+    for (let attempt = 0; attempt < 40 && state.providers?.['openai-codex']?.models === undefined; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await check('a stale model cache makes the boot pass fetch and write the list', () => {
+      assert.equal(net.calls.filter((entry) => entry.url.includes('/codex/models')).length, 1);
+      assert.deepEqual(state.providers['openai-codex'].models.map((entry) => entry.id), ['gpt-6.2-sol']);
+    });
+  } finally {
+    net.restore();
+    await seedFreshModelsCache();
+  }
+}
+
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  await seedFreshModelsCache();
+  const net = installFetch([]);
+  apply(ctx, { codexAuthPath: codexAuthFile });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await check('a fresh model cache keeps the boot pass off the network', () => {
+      assert.equal(net.calls.length, 0);
+    });
+  } finally {
+    net.restore();
+  }
+}
+
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  await clearModelsCache();
+  const net = installFetch([]);
+  apply(ctx, { codexAuthPath: codexAuthFile, autoRefreshModels: false });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await check('autoRefreshModels:false keeps the boot pass to the route only', () => {
+      assert.equal(net.calls.length, 0);
+      assert.equal(state.providers['openai-codex'].models, undefined);
+    });
+  } finally {
+    net.restore();
+    await seedFreshModelsCache();
+  }
+}
+
+// ---- 35. manageModels:false leaves the catalog-backed route alone
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  apply(ctx, { codexAuthPath: codexAuthFile, manageModels: false, autoEnableRoute: false });
+  const net = installFetch([]);
+  try {
+    const refreshed = await request(state, 'POST', '/gpt-codex/models/refresh', {});
+    await check('manageModels:false refuses to touch the model list at all', () => {
+      assert.equal(refreshed.json.ok, false);
+      assert.equal(refreshed.json.code, 'DISABLED');
+      assert.equal(net.calls.length, 0);
+    });
+  } finally {
+    net.restore();
+  }
+}
+
+// ---- 36. an empty server answer never wipes the route's catalog
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  apply(ctx, { codexAuthPath: codexAuthFile, autoEnableRoute: false });
+  const net = installFetch([
+    { match: 'chatgpt.com/backend-api/codex/models', reply: modelsReply([modelRow({ visibility: 'hide' })]) },
+  ]);
+  try {
+    const refreshed = await request(state, 'POST', '/gpt-codex/models/refresh', {});
+    await check('a catalog with no listable row is refused, not written', () => {
+      assert.equal(refreshed.json.ok, false);
+      assert.equal(refreshed.json.code, 'EMPTY_CATALOG');
+      assert.equal(state.settingsWrites.length, 0);
+    });
+  } finally {
+    net.restore();
+  }
+}
+
+// ---- 37. gpt_status reports the model list state, and gpt_models is registered
+{
+  const { ctx, state } = makeCtx();
+  state.records.set('llm-pi-ai/openai-codex', {
+    kind: 'grant',
+    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
+  });
+  apply(ctx, { codexAuthPath: codexAuthFile, autoEnableRoute: false });
+  await check('gpt_status reports how the served model list is maintained', async () => {
+    const value = await request(state, 'GET', '/gpt-codex/status', {});
+    assert.equal(value.json.models.managed, true);
+    assert.equal(value.json.models.autoRefresh, true);
+    assert.equal(value.json.models.refreshHours, 24);
+    // The renderer names the model facts so "a model is missing" is diagnosable.
+    const tool = state.tools.get('gpt_status');
+    const rendered = tool.output.render({}, value.json);
+    assert.match(rendered[0].text, /模型列表/);
+    assert.ok(state.tools.has('gpt_models'), 'gpt_models is registered');
+  });
 }
 
 globalThis.fetch = realFetch;
