@@ -149,7 +149,6 @@ window.__ModuleLoader__.load({
       const [attempt, setAttempt] = React.useState(undefined);
       const [answer, setAnswer] = React.useState('');
       const [probe, setProbe] = React.useState(undefined);
-      const [apiKey, setApiKey] = React.useState('');
       const [apiKeyProbe, setApiKeyProbe] = React.useState(undefined);
 
       const refresh = React.useCallback(async () => {
@@ -300,38 +299,12 @@ window.__ModuleLoader__.load({
         });
 
       /**
-       * Store a Platform key.
+       * Verify the key the route in force actually uses.
        *
-       * The field is cleared as soon as the Host accepts it — the key's only home
-       * is the credential store, and leaving it in a React state would keep it
-       * visible in the DOM for as long as the page stays open.
+       * The Host decides which destination that is, and refuses to send anything
+       * when the route points at a relay or binds another reference — this handler
+       * only prints what came back.
        */
-      const saveApiKey = () =>
-        run('save-key', async () => {
-          const result = await call('/api-key', { method: 'POST', body: { apiKey } });
-          setApiKey('');
-          setApiKeyProbe(result.probe);
-          const routeNote = result.route?.changed
-            ? '已自动启用 openai route。'
-            : result.route?.reason === 'already-configured'
-              ? 'openai route 早已存在。'
-              : `openai route 未改动（${result.route?.reason ?? 'unknown'}）。`;
-          const probeNote =
-            result.probe === undefined
-              ? ''
-              : result.probe.ok === true
-                ? `真实验证通过 —— ${result.probe.detail}`
-                : `真实验证失败 —— ${result.probe.detail}`;
-          return [`已保存 API key（reference ${result.ref}）。`, routeNote, probeNote].filter((part) => part !== '').join(' ');
-        });
-
-      const clearApiKey = () =>
-        run('clear-key', async () => {
-          const result = await call('/api-key', { method: 'DELETE' });
-          setApiKeyProbe(undefined);
-          return `已删除本机保存的 API key（reference ${result.ref}）。`;
-        });
-
       const verifyApiKey = () =>
         run('verify-key', async () => {
           const result = await call('/api-key/verify');
@@ -592,29 +565,39 @@ window.__ModuleLoader__.load({
                   )
                 : React.createElement('span', { style: styles.badge('off') }, '未启用'),
           ),
-          React.createElement('input', {
-            style: styles.input,
-            type: 'password',
-            value: apiKey,
-            placeholder: key.configured ? '要替换的话，粘贴新的 key（不会回显已保存的值）' : 'sk-...',
-            onChange: (event) => setApiKey(event.target.value),
-            autoComplete: 'off',
-            spellCheck: false,
-          }),
+          key.route?.baseURL && key.route.catalogDestination !== true
+            ? React.createElement(Row, { label: 'route 指向' }, key.route.baseURL)
+            : null,
+          // A route that points somewhere else, or binds another reference, is a
+          // route this plugin must not write a key for: say so instead of offering
+          // a button that would either be refused or send a secret to the wrong
+          // destination.
+          key.bindingMismatch === 'destination'
+            ? React.createElement(
+                'p',
+                { style: styles.hint },
+                '这条 openai route 指向自定义端点，不是 api.openai.com；它的 key 属于那个端点，本插件不会拿自己的 reference 去验证或改写它。要在这台机器上验证自己的 key，请先在「设置 → 模型」里把这条 route 指回默认端点。',
+              )
+            : null,
+          key.bindingMismatch === 'reference'
+            ? React.createElement(
+                'p',
+                { style: styles.hint },
+                `这条 openai route 绑定的是 ${key.route?.apiKeyEnv ?? '另一个 reference'}，不是本插件的 ${key.configuredRef ?? 'OPENAI_API_KEY'}；写入和验证都以 route 的绑定方为准，本插件不插手。`,
+              )
+            : null,
+          React.createElement(
+            'p',
+            { style: styles.hint },
+            'API key 由「设置 → 模型」里 ',
+            React.createElement('code', null, 'openai'),
+            ' 那一行的凭据输入框写入：那里是这套应用唯一经过授权的凭据写入口，写进去的就是 ',
+            React.createElement('code', null, 'OPENAI_API_KEY'),
+            ' 这个 reference，本插件不会另存一份，也不提供第二条写入路径。',
+          ),
           React.createElement(
             'div',
             { style: styles.buttons },
-            React.createElement(
-              'button',
-              {
-                type: 'button',
-                style: apiKey.trim() === '' ? styles.button : styles.primary,
-                disabled: busy !== '' || apiKey.trim() === '' || key.enabled === false,
-                onClick: saveApiKey,
-                title: '把 key 写进 Harness 凭据库，并启用 openai route',
-              },
-              busy === 'save-key' ? '保存中…' : '保存并启用',
-            ),
             key.route?.configured
               ? null
               : React.createElement(
@@ -622,18 +605,11 @@ window.__ModuleLoader__.load({
                   { type: 'button', style: styles.button, disabled: busy !== '' || key.enabled === false, onClick: enableApiKeyRoute },
                   busy === 'key-route' ? '启用中…' : '仅启用 route',
                 ),
-            key.configured
+            key.configured && key.bindingMismatch === undefined
               ? React.createElement(
                   'button',
                   { type: 'button', style: styles.button, disabled: busy !== '', onClick: verifyApiKey },
                   busy === 'verify-key' ? '验证中…' : '验证 key',
-                )
-              : null,
-            key.configured
-              ? React.createElement(
-                  'button',
-                  { type: 'button', style: styles.danger, disabled: busy !== '', onClick: clearApiKey },
-                  busy === 'clear-key' ? '删除中…' : '删除 key',
                 )
               : null,
           ),
@@ -653,9 +629,7 @@ window.__ModuleLoader__.load({
             { style: styles.hint },
             '验证是对 ',
             React.createElement('code', null, 'api.openai.com/v1/models'),
-            ' 发一次不带 token 费用的请求，只会说明 key 是否被接受、以及能看见多少个模型。key 保存后与「设置 → 模型」里填的 ',
-            React.createElement('code', null, 'OPENAI_API_KEY'),
-            ' 是同一个值。',
+            ' 发一次不花 token 的请求，只说明这把 key 能否列出模型——能列模型不等于能推理，也不等于能计费。route 指向自定义端点、或绑定了别的 reference 时，插件不会发这次请求，以免把 key 交给它没被签发的地方。',
           ),
         ),
 
@@ -803,6 +777,9 @@ window.__ModuleLoader__.load({
 
       if (isApiKey) {
         const key = status?.apiKey ?? {};
+        const destination = key.route?.catalogDestination === false
+          ? `这条 route 指向 ${key.route?.baseURL ?? '自定义端点'}，不是 api.openai.com。`
+          : '';
         return React.createElement(
           'div',
           { style: { marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--dsw-alias-border-l1)' } },
@@ -816,7 +793,8 @@ window.__ModuleLoader__.load({
           React.createElement(
             'span',
             { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } },
-            '在本行下方直接填 key，或到「设置 → GPT 接入」里管理与验证。',
+            'key 由本行自己的凭据输入框写入（那是应用唯一授权的写入路径）。',
+            destination,
           ),
           note === ''
             ? null

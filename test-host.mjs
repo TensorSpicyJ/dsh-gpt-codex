@@ -1404,44 +1404,54 @@ function modelRow(overrides = {}) {
   await check('status and /api-key/status both report an unconfigured Platform key', () => {
     assert.equal(status.json.apiKey.configured, false);
     assert.equal(status.json.apiKey.ref, 'OPENAI_API_KEY');
+    assert.equal(status.json.apiKey.configuredRef, 'OPENAI_API_KEY');
     assert.equal(status.json.apiKey.route.configured, false);
     assert.equal(keyStatus.json.configured, false);
     assert.equal(keyStatus.json.enabled, true);
   });
 }
 
-// ---- 38. storing a key writes the reference and enables the openai route
+// ---- 38. the plugin exposes no credential write path of its own
+//
+// The review asked for exactly this boundary: a raw `sk-…` accepted as a tool
+// argument lands in the assistant's message before the tool runs, so trimming it
+// from the result protects nothing; and a second writer of a shared reference can
+// silently break whoever else depends on it. Both writes belong to the Models UI.
 {
   const { ctx, state } = makeCtx();
   apply(ctx, { codexAuthPath: codexAuthFile });
-  const stored = await request(state, 'POST', '/gpt-codex/api-key', { apiKey: 'sk-test-0123456789abcdefghij', verify: false });
-  await check('POST /api-key stores the key and enables the openai route', () => {
-    assert.equal(stored.status, 200);
-    assert.equal(stored.json.ok, true);
-    assert.equal(stored.json.ref, 'OPENAI_API_KEY');
-    assert.equal(stored.json.route.changed, true);
-    // The route is the catalog-backed `openai` profile bound to the reference.
-    assert.deepEqual(state.providers.openai, { apiKeyEnv: 'OPENAI_API_KEY', transport: 'sse' });
-    assert.equal(state.refs.get('OPENAI_API_KEY'), 'sk-test-0123456789abcdefghij');
-    // And nothing was written to the ChatGPT grant.
-    assert.equal(state.records.has('llm-pi-ai/openai-codex'), false);
-    // `verify:false` must stay offline.
-    assert.equal(stored.json.probe, undefined);
+  await check('no credential-writing route and no key-carrying tool is registered', () => {
+    // The read-only views stay.
+    assert.ok(state.routes.has('/gpt-codex/api-key/status'));
+    assert.ok(state.routes.has('/gpt-codex/api-key/verify'));
+    assert.ok(state.routes.has('/gpt-codex/api-key/route'));
+    // The write path is gone, not merely undocumented.
+    assert.equal(state.routes.has('/gpt-codex/api-key'), false);
+    assert.equal(state.tools.has('gpt_set_api_key'), false);
+    assert.equal(state.tools.has('gpt_clear_api_key'), false);
+    // And nothing else accepts a key-shaped argument.
+    for (const [name, tool] of state.tools) {
+      const properties = tool.parameters?.properties ?? {};
+      for (const field of Object.keys(properties)) {
+        assert.equal(/^apiKey$|^key$|^secret$/.test(field), false, `${name} must not take a raw secret (${field})`);
+      }
+    }
   });
 }
 
-// ---- 39. the status view never echoes the secret
+// ---- 39. a key stored by the Models page is reported by family only
 {
   const { ctx, state } = makeCtx();
   apply(ctx, { codexAuthPath: codexAuthFile });
   const secret = 'sk-proj-abcdefghijklmnopqrstuvwxyz';
-  await request(state, 'POST', '/gpt-codex/api-key', { apiKey: secret, verify: false });
+  // This is what the Models page's own credential field does: one `set` on the
+  // reference the route names. The plugin only ever reads it.
+  state.refs.set('OPENAI_API_KEY', secret);
   const status = await request(state, 'GET', '/gpt-codex/status');
   const keyStatus = await request(state, 'GET', '/gpt-codex/api-key/status');
   await check('the key is reported by family only, never by value', () => {
     assert.equal(status.json.apiKey.configured, true);
     assert.equal(status.json.apiKey.family, 'project');
-    assert.equal(status.json.apiKey.route.configured, true);
     assert.equal(keyStatus.json.source, 'file');
     for (const payload of [status.json, keyStatus.json]) {
       assert.equal(JSON.stringify(payload).includes(secret), false);
@@ -1453,7 +1463,7 @@ function modelRow(overrides = {}) {
 {
   const { ctx, state } = makeCtx();
   apply(ctx, { codexAuthPath: codexAuthFile });
-  await request(state, 'POST', '/gpt-codex/api-key', { apiKey: 'sk-test-0123456789abcdefghij', verify: false });
+  state.refs.set('OPENAI_API_KEY', 'sk-test-0123456789abcdefghij');
   const net = installFetch([
     {
       match: 'api.openai.com/v1/models',
@@ -1470,8 +1480,10 @@ function modelRow(overrides = {}) {
       assert.equal(verified.status, 200);
       assert.equal(verified.json.probe.ok, true);
       assert.equal(verified.json.probe.models, 2);
+      // The claim is scoped to listing models; it never implies inference works.
+      assert.equal(verified.json.probe.scope, 'models');
       assert.match(verified.json.probe.detail, /接受了这个 key/);
-      // The request carried the key and nothing else.
+      assert.match(verified.json.probe.detail, /不代表推理或计费可用/);
       const call = net.calls[0];
       assert.equal(call.init.method, 'GET');
       assert.equal(call.init.headers.authorization, 'Bearer sk-test-0123456789abcdefghij');
@@ -1486,7 +1498,7 @@ function modelRow(overrides = {}) {
 {
   const { ctx, state } = makeCtx();
   apply(ctx, { codexAuthPath: codexAuthFile });
-  await request(state, 'POST', '/gpt-codex/api-key', { apiKey: 'sk-wrong-0123456789abcdefghij', verify: false });
+  state.refs.set('OPENAI_API_KEY', 'sk-wrong-0123456789abcdefghij');
   const net = installFetch([
     { match: 'api.openai.com/v1/models', reply: { status: 401, body: '{"error":{"message":"Incorrect API key provided"}}' } },
   ]);
@@ -1505,48 +1517,114 @@ function modelRow(overrides = {}) {
   }
 }
 
-// ---- 42. shape checks keep obvious mistakes out of the credential store
+// ---- 42. a 429 and an unreadable 2xx are both reported as failures
+//
+// The review singled this out: a rate-limited key and a 2xx with an unexpected
+// body are not credential validations, and calling them "passed" would tell the
+// user a key works when nothing established that.
 {
   const { ctx, state } = makeCtx();
   apply(ctx, { codexAuthPath: codexAuthFile });
-  const blank = await request(state, 'POST', '/gpt-codex/api-key', { apiKey: '   ', verify: false });
-  const spaced = await request(state, 'POST', '/gpt-codex/api-key', { apiKey: 'sk-test\n0123456789abcdefghij', verify: false });
-  const short = await request(state, 'POST', '/gpt-codex/api-key', { apiKey: 'sk-short', verify: false });
-  await check('blank, whitespace-carrying and short keys are refused before any write', () => {
-    assert.equal(blank.status, 500);
-    assert.match(blank.json.error.message, /不能为空/);
-    assert.equal(spaced.status, 500);
-    assert.match(spaced.json.error.message, /空白字符/);
-    assert.equal(short.status, 500);
-    assert.match(short.json.error.message, /长度过短/);
-    assert.equal(state.refs.has('OPENAI_API_KEY'), false);
-    // A refused write must not have enabled the route either.
-    assert.equal(state.providers?.openai, undefined);
+  state.refs.set('OPENAI_API_KEY', 'sk-test-0123456789abcdefghij');
+
+  const throttled = installFetch([
+    { match: 'api.openai.com/v1/models', reply: { status: 429, body: '{"error":{"message":"Rate limit reached"}}' } },
+  ]);
+  let quota;
+  try {
+    quota = await request(state, 'GET', '/gpt-codex/api-key/verify');
+  } finally {
+    throttled.restore();
+  }
+  const odd = installFetch([
+    { match: 'api.openai.com/v1/models', reply: { status: 200, headers: { 'content-type': 'text/html' }, body: '<html>gateway</html>' } },
+  ]);
+  let unexpected;
+  try {
+    unexpected = await request(state, 'GET', '/gpt-codex/api-key/verify');
+  } finally {
+    odd.restore();
+  }
+
+  await check('a 429 is QUOTA, and a 2xx with a non-JSON body is UNEXPECTED_RESPONSE', () => {
+    assert.equal(quota.json.probe.ok, false);
+    assert.equal(quota.json.probe.code, 'QUOTA');
+    assert.match(quota.json.probe.detail, /不算验证通过/);
+    assert.equal(unexpected.json.probe.ok, false);
+    assert.equal(unexpected.json.probe.code, 'UNEXPECTED_RESPONSE');
+    // Neither path may claim the key works.
+    for (const payload of [quota.json.probe, unexpected.json.probe]) {
+      assert.equal(payload.ok, false);
+      assert.equal(payload.scope, undefined);
+    }
   });
 }
 
-// ---- 43. DELETE removes the reference but leaves the subscription grant alone
+// ---- 43. a route pointed at a custom endpoint is never probed
+//
+// A relay's key was issued for the relay. Sending it to api.openai.com would hand
+// someone's secret to a service it was never given to, so the answer has to be a
+// report and zero outbound requests.
 {
   const { ctx, state } = makeCtx();
-  state.records.set('llm-pi-ai/openai-codex', {
-    kind: 'grant',
-    payload: { type: 'oauth', access: accessToken, refresh: 'r', expires: expiresAtMs, accountId },
-  });
+  state.providers = { openai: { apiKeyEnv: 'OPENAI_API_KEY', baseURL: 'https://relay.example/v1' } };
+  state.refs.set('OPENAI_API_KEY', 'sk-test-0123456789abcdefghij');
   apply(ctx, { codexAuthPath: codexAuthFile });
-  await request(state, 'POST', '/gpt-codex/api-key', { apiKey: 'sk-test-0123456789abcdefghij', verify: false });
-  const cleared = await request(state, 'DELETE', '/gpt-codex/api-key');
-  const keyStatus = await request(state, 'GET', '/gpt-codex/api-key/status');
-  await check('DELETE /api-key clears the reference without touching the grant', () => {
-    assert.equal(cleared.json.ok, true);
-    assert.equal(state.refs.has('OPENAI_API_KEY'), false);
-    assert.equal(keyStatus.json.configured, false);
-    // The route stays: it is a settings value, not part of the secret.
-    assert.equal(keyStatus.json.route.configured, true);
-    assert.equal(state.records.has('llm-pi-ai/openai-codex'), true);
+  const net = installFetch([{ match: 'api.openai.com', reply: { status: 200, body: '{"data":[]}' } }]);
+  let verified;
+  let keyStatus;
+  try {
+    verified = await request(state, 'GET', '/gpt-codex/api-key/verify');
+    keyStatus = await request(state, 'GET', '/gpt-codex/api-key/status');
+  } finally {
+    net.restore();
+  }
+  await check('a custom baseURL yields CUSTOM_DESTINATION with no request sent', () => {
+    assert.equal(verified.json.probe.ok, false);
+    assert.equal(verified.json.probe.code, 'CUSTOM_DESTINATION');
+    assert.match(verified.json.probe.detail, /自定义端点/);
+    assert.equal(net.calls.length, 0, 'the key must not leave the machine');
+    assert.equal(keyStatus.json.bindingMismatch, 'destination');
+    assert.equal(keyStatus.json.route.catalogDestination, false);
+    assert.equal(keyStatus.json.route.baseURL, 'https://relay.example/v1');
   });
 }
 
-// ---- 44. an existing openai profile is never overwritten
+// ---- 44. a route bound to another reference is not verified with ours
+//
+// `OPENAI_API_KEY` can belong to a Models configuration the user set up by hand.
+// The route names the reference whose key is actually sent; if that is not the
+// one this plugin manages, verifying ours would answer a question nobody asked.
+{
+  const { ctx, state } = makeCtx();
+  state.providers = { openai: { apiKeyEnv: 'MY_OWN_OPENAI_KEY', transport: 'sse' } };
+  state.refs.set('MY_OWN_OPENAI_KEY', 'sk-own-0123456789abcdefghij');
+  state.refs.set('OPENAI_API_KEY', 'sk-plugin-0123456789abcdefghij');
+  apply(ctx, { codexAuthPath: codexAuthFile, apiKeyEnv: 'OPENAI_API_KEY' });
+  const net = installFetch([{ match: 'api.openai.com', reply: { status: 200, body: '{"data":[]}' } }]);
+  let verified;
+  let keyStatus;
+  try {
+    verified = await request(state, 'GET', '/gpt-codex/api-key/verify');
+    keyStatus = await request(state, 'GET', '/gpt-codex/api-key/status');
+  } finally {
+    net.restore();
+  }
+  await check('a differently-bound reference yields BINDING_MISMATCH with no request sent', () => {
+    assert.equal(verified.json.probe.ok, false);
+    assert.equal(verified.json.probe.code, 'BINDING_MISMATCH');
+    assert.equal(verified.json.probe.ref, 'MY_OWN_OPENAI_KEY');
+    assert.equal(net.calls.length, 0);
+    // Status reports the reference in force, and keeps the configured one visible.
+    assert.equal(keyStatus.json.ref, 'MY_OWN_OPENAI_KEY');
+    assert.equal(keyStatus.json.configuredRef, 'OPENAI_API_KEY');
+    assert.equal(keyStatus.json.bindingMismatch, 'reference');
+    // The foreign key was never probed, but it is reported as stored.
+    assert.equal(keyStatus.json.configured, true);
+  });
+}
+
+// ---- 45. an existing openai profile is never overwritten
 {
   const { ctx, state } = makeCtx();
   state.providers = { openai: { apiKeyEnv: 'MY_OWN_OPENAI_KEY', baseURL: 'https://gateway.example/v1' } };
@@ -1563,20 +1641,24 @@ function modelRow(overrides = {}) {
   });
 }
 
-// ---- 45. a custom reference is honoured end to end
+// ---- 46. a custom apiKeyEnv is the reference a fresh route binds
 {
   const { ctx, state } = makeCtx();
   apply(ctx, { codexAuthPath: codexAuthFile, apiKeyEnv: 'TEAM_OPENAI_KEY' });
-  const stored = await request(state, 'POST', '/gpt-codex/api-key', { apiKey: 'sk-test-0123456789abcdefghij', verify: false });
-  await check('a custom apiKeyEnv is what gets written and bound', () => {
-    assert.equal(stored.json.ref, 'TEAM_OPENAI_KEY');
-    assert.equal(state.refs.get('TEAM_OPENAI_KEY'), 'sk-test-0123456789abcdefghij');
-    assert.equal(state.refs.has('OPENAI_API_KEY'), false);
+  const route = await request(state, 'POST', '/gpt-codex/api-key/route');
+  const keyStatus = await request(state, 'GET', '/gpt-codex/api-key/status');
+  await check('a custom apiKeyEnv is what a new route binds', () => {
+    assert.equal(route.json.changed, true);
     assert.deepEqual(state.providers.openai, { apiKeyEnv: 'TEAM_OPENAI_KEY', transport: 'sse' });
+    assert.equal(keyStatus.json.ref, 'TEAM_OPENAI_KEY');
+    assert.equal(keyStatus.json.configuredRef, 'TEAM_OPENAI_KEY');
+    // A catalog-destination route is not a mismatch.
+    assert.equal(keyStatus.json.bindingMismatch, undefined);
+    assert.equal(keyStatus.json.route.catalogDestination, true);
   });
 }
 
-// ---- 46. a reference outside the grammar is refused at load time
+// ---- 47. a reference outside the grammar is refused at load time
 {
   const { ctx } = makeCtx();
   let thrown;
@@ -1590,40 +1672,6 @@ function modelRow(overrides = {}) {
     assert.match(thrown.message, /apiKeyEnv/);
     assert.match(thrown.message, /must match/);
   });
-}
-
-// ---- 47. gpt_set_api_key / gpt_clear_api_key round-trip through the tools
-{
-  const { ctx, state } = makeCtx();
-  apply(ctx, { codexAuthPath: codexAuthFile });
-  const net = installFetch([
-    {
-      match: 'api.openai.com/v1/models',
-      reply: { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ data: [{ id: 'gpt-6.1-sol' }] }) },
-    },
-  ]);
-  try {
-    const setTool = state.tools.get('gpt_set_api_key');
-    const clearTool = state.tools.get('gpt_clear_api_key');
-    const saved = await setTool.execute({ apiKey: 'sk-test-0123456789abcdefghij' });
-    await check('gpt_set_api_key stores, enables and verifies in one call', () => {
-      assert.equal(saved.ok, true);
-      assert.equal(saved.route.changed, true);
-      assert.equal(saved.probe.ok, true);
-      const blocks = setTool.output.render({}, saved);
-      assert.match(blocks[0].text, /API key/);
-      assert.match(blocks[0].text, /通过/);
-    });
-    const cleared = await clearTool.execute({});
-    await check('gpt_clear_api_key removes the reference', () => {
-      assert.equal(cleared.ok, true);
-      assert.equal(state.refs.has('OPENAI_API_KEY'), false);
-      const blocks = clearTool.output.render({}, cleared);
-      assert.match(blocks[0].text, /已删除/);
-    });
-  } finally {
-    net.restore();
-  }
 }
 
 // ---- 48. a stored key enables its route on load, without a panel visit
@@ -1641,14 +1689,17 @@ function modelRow(overrides = {}) {
 // ---- 49. disabling the API-key half keeps the plugin off that route
 {
   const { ctx, state } = makeCtx();
+  state.refs.set('OPENAI_API_KEY', 'sk-test-0123456789abcdefghij');
   apply(ctx, { codexAuthPath: codexAuthFile, enableApiKeyRoute: false });
-  const stored = await request(state, 'POST', '/gpt-codex/api-key', { apiKey: 'sk-test-0123456789abcdefghij', verify: false });
+  // Even the boot pass must leave the route alone, key or no key.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const route = await request(state, 'POST', '/gpt-codex/api-key/route');
   await check('enableApiKeyRoute:false stops the route from being added', () => {
-    assert.equal(stored.json.route.changed, false);
-    assert.equal(stored.json.route.reason, 'disabled');
     assert.equal(state.providers?.openai, undefined);
-    // The key itself is still stored — that is a separate, explicit choice.
+    // The key itself is still readable — that is a separate, explicit choice.
     assert.equal(state.refs.get('OPENAI_API_KEY'), 'sk-test-0123456789abcdefghij');
+    // The explicit route request still honours the switch.
+    assert.equal(route.json.ok, true);
   });
 }
 

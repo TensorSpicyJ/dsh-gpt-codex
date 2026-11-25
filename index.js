@@ -59,6 +59,19 @@
  *
  * The two halves share the credential store, the settings seam and the panel;
  * they are independent otherwise, and both routes can be enabled at once.
+ *
+ * ## What this half does *not* do
+ *
+ * It does not write or delete the key. The only authorised credential writer in
+ * this application is the Models page, and a second writer of a shared reference
+ * can silently break whoever else depends on it — including a route the user
+ * configured by hand. So there is no key-carrying tool and no `POST`/`DELETE`
+ * route here: this half only enables the route, reads the reference the route
+ * actually resolves, and asks the destination whether that key may list models.
+ *
+ * The probe is guarded by the route's *destination*, not by our setting: a route
+ * with a custom `baseURL` or a hand-bound reference sends traffic somewhere this
+ * plugin did not choose, and its key is reported, never replayed.
  */
 
 import { existsSync, promises as fsp, readFileSync } from 'node:fs';
@@ -126,11 +139,40 @@ function apiKeyRouteProfile(ref) {
   return { apiKeyEnv: ref, transport: 'sse' };
 }
 
-/** Where an `sk-…` key is checked. Free, cheap, and answers "does it work". */
+/**
+ * Where an `sk-…` key is checked. Free, cheap, and answers exactly one question:
+ * may this key list models.
+ */
 const API_KEY_PROBE_URL = 'https://api.openai.com/v1/models';
+
+/**
+ * The `baseURL` and `api` the installed catalog gives the `openai` provider.
+ *
+ * Restated only so the plugin can recognise a route that points somewhere else.
+ * A route carrying either of these values is not the catalog-backed route this
+ * plugin manages, and a key bound to it belongs to that destination — probing
+ * `api.openai.com` with it would hand someone's secret to a service it was never
+ * issued for.
+ */
+const CATALOG_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+const CATALOG_OPENAI_API = 'openai-responses';
 
 /** The credential seam's reference grammar, restated to validate config. */
 const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Trim and bound a string lifted out of an upstream error body before it can
+ * reach the panel or a tool output.
+ *
+ * A credential path must never replay an upstream payload verbatim: an OpenAI
+ * error body carries the key prefix, the organisation, and occasionally the whole
+ * request echo. Only the first line, with a hard length cap, is kept.
+ */
+function safeErrorDetail(text) {
+  if (typeof text !== 'string') return '';
+  const firstLine = text.split(/\r?\n/, 1)[0].replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-***').trim();
+  return firstLine.length > 160 ? `${firstLine.slice(0, 160)}…` : firstLine;
+}
 
 /** Profile entry id / settings namespace that owns the provider routes. */
 const SETTINGS_NS = 'llm-pi-ai';
@@ -412,7 +454,7 @@ async function refreshGrant(refreshToken, signal, proxyUrl) {
     if (response.status === 400 || response.status === 401 || response.status === 403) {
       return { error: `refresh token 已失效（HTTP ${response.status}），需要重新登录`, dead: true };
     }
-    return { error: `刷新失败（HTTP ${response.status}）${text ? `：${text.slice(0, 200)}` : ''}` };
+    return { error: `刷新失败（HTTP ${response.status}）${text ? `：${safeErrorDetail(text)}` : ''}` };
   }
   let body;
   try {
@@ -504,7 +546,7 @@ async function probeBackend(accessToken, accountId, signal, proxyUrl) {
       ok: false,
       status: response.status,
       code: response.status === 401 || response.status === 403 ? 'UNAUTHORIZED' : response.status === 429 ? 'RATE_LIMITED' : 'HTTP_ERROR',
-      detail: `Codex 后端返回 HTTP ${response.status}${text ? `：${text.slice(0, 300)}` : ''}`,
+      detail: `Codex 后端返回 HTTP ${response.status}${text ? `：${safeErrorDetail(text)}` : ''}`,
     };
   }
 
@@ -556,14 +598,22 @@ function describeRecord(record) {
 }
 
 /**
- * Ask `api.openai.com` whether it accepts this key.
+ * Ask `api.openai.com` whether this key may list models.
  *
  * `/v1/models` is the cheapest authenticated endpoint OpenAI publishes: it costs
- * no tokens, returns the models the key may use, and separates the three failure
- * modes a stored key can have — rejected (`401`), unusable for billing (`429`), or
- * merely wrong-region (`403`). Checking a key is worth doing because a Platform
- * key has no expiry to read: `sk-…` carries no claims, so "stored" is the entire
- * local fact and only the server can say whether it is live.
+ * no tokens and separates the failures a stored key can have — rejected (`401`),
+ * forbidden for this region or project (`403`), out of quota or rate-limited
+ * (`429`).
+ *
+ * What a 2xx here does **not** prove: that the key may run inference, that the
+ * project has credit, or that the account can be billed. Listing models is a
+ * separate permission on a separate endpoint, so the result is reported as
+ * exactly that — the key is accepted *for listing* — and never as "the key
+ * works". The same care applies downwards: a 429 is reported as a failed
+ * verification (the key could not list models right now), not as success.
+ *
+ * An upstream error body is filtered through {@link safeErrorDetail}: it can echo
+ * the key prefix and the organisation, and a credential path must not replay it.
  *
  * @returns `{ ok, status, code, detail, models? }`.
  */
@@ -577,18 +627,22 @@ async function probeApiKey(apiKey, signal) {
     });
   } catch (error) {
     if (signal?.aborted === true) return { ok: false, code: 'ABORTED', detail: '探测被取消' };
-    return { ok: false, code: 'NETWORK', detail: `无法连接 api.openai.com：${error && error.message ? error.message : String(error)}` };
+    return {
+      ok: false,
+      code: 'NETWORK',
+      detail: `无法连接 api.openai.com：${safeErrorDetail(error && error.message ? error.message : String(error))}`,
+    };
   }
 
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
+    const text = safeErrorDetail(await response.text().catch(() => ''));
     const code =
       response.status === 401 ? 'UNAUTHORIZED' : response.status === 403 ? 'FORBIDDEN' : response.status === 429 ? 'QUOTA' : 'HTTP_ERROR';
     const hint =
       code === 'UNAUTHORIZED'
         ? '（key 被拒绝：确认它没有撤销、也没有贴错）'
         : code === 'QUOTA'
-          ? '（key 有效但额度或速率受限）'
+          ? '（key 此刻没能列出模型：额度或速率受限，这不算验证通过）'
           : code === 'FORBIDDEN'
             ? '（key 被拒绝：可能受限地区或没有该项目权限）'
             : '';
@@ -596,7 +650,7 @@ async function probeApiKey(apiKey, signal) {
       ok: false,
       status: response.status,
       code,
-      detail: `api.openai.com 返回 HTTP ${response.status}${hint}${text ? `：${text.slice(0, 200)}` : ''}`,
+      detail: `api.openai.com 返回 HTTP ${response.status}${hint}${text ? `：${text}` : ''}`,
     };
   }
 
@@ -604,16 +658,24 @@ async function probeApiKey(apiKey, signal) {
   try {
     body = await response.json();
   } catch {
-    return { ok: true, status: response.status, detail: 'api.openai.com 接受了这个 key（响应不是 JSON，未统计模型数）' };
+    // A 2xx with an unreadable body is not proof the key lists models: only the
+    // endpoint's own answer counts, and this is not that answer.
+    return {
+      ok: false,
+      status: response.status,
+      code: 'UNEXPECTED_RESPONSE',
+      detail: 'api.openai.com 返回了 2xx，但响应不是 JSON，无法确认这个 key 能列出模型。',
+    };
   }
   const ids = Array.isArray(body?.data) ? body.data.map((model) => model?.id).filter((id) => typeof id === 'string') : [];
   return {
     ok: true,
     status: response.status,
+    scope: 'models',
     detail:
       ids.length === 0
-        ? 'api.openai.com 接受了这个 key'
-        : `api.openai.com 接受了这个 key（可见 ${ids.length} 个模型，例如 ${ids.slice(0, 3).join('、')}）`,
+        ? 'api.openai.com 接受了这个 key（/v1/models 返回成功；这只说明能列模型，不代表推理或计费可用）'
+        : `api.openai.com 接受了这个 key（/v1/models 可见 ${ids.length} 个模型，例如 ${ids.slice(0, 3).join('、')}；这只说明能列模型，不代表推理或计费可用）`,
     models: ids.length,
   };
 }
@@ -1051,6 +1113,10 @@ export function apply(ctx, rawConfig) {
    * @returns `{ changed, reason, apiKeyEnv? }`; never throws.
    */
   const ensureApiKeyRoute = async (ref = settings.apiKeyEnv) => {
+    // The switch governs every path that could add the route, including the
+    // explicit HTTP route and the boot pass: a plugin told to stay off Platform
+    // billing must not add it just because a key happens to exist.
+    if (!settings.enableApiKeyRoute) return { changed: false, reason: 'disabled' };
     const service = settingsService();
     if (service === void 0) return { changed: false, reason: 'no-settings-service' };
     let descriptor;
@@ -1083,7 +1149,7 @@ export function apply(ctx, rawConfig) {
   };
 
   /**
-   * Read the Platform key out of the credential seam.
+   * Read a Platform key out of the credential seam.
    *
    * Three facts come back because they mean different things. `configured` is
    * the seam's own answer (a reference that is set but blank counts as unset, and
@@ -1091,12 +1157,12 @@ export function apply(ctx, rawConfig) {
    * says whether it came from the store or the launch environment, and `value` is
    * the secret — never logged, never sent to the panel.
    *
+   * @param ref - which credential reference to resolve.
    * @returns `{ configured, value?, source? }`.
    */
-  const readApiKey = async () => {
+  const readApiKey = async (ref = settings.apiKeyEnv) => {
     const store = credentials();
     if (store === void 0) return { configured: false };
-    const ref = settings.apiKeyEnv;
 
     let source;
     try {
@@ -1130,95 +1196,133 @@ export function apply(ctx, rawConfig) {
   };
 
   /**
-   * Everything the panel may know about the Platform key, and nothing more.
+   * The `openai` route as it is actually configured, and where it sends traffic.
    *
-   * The value itself never leaves this function: the panel gets `configured`,
-   * the reference name, where the value came from, and which family the key
-   * belongs to. A user who wants to check the key can paste it again or run the
-   * probe; showing it back would only make it visible in a screenshot.
+   * This exists because "the plugin's reference" and "the route's destination"
+   * are two separate facts and a key may only be sent to the second one. A route
+   * that carries a custom `baseURL` — a relay, a gateway, a regional endpoint —
+   * belongs to that destination: the key it binds was issued for *that* service,
+   * and probing `api.openai.com` with it would hand someone's secret to a party
+   * it was never given to.
+   *
+   * @returns `{ configured, apiKeyEnv?, baseURL?, api?, transport?, catalogDestination, reason? }`.
    */
-  const readApiKeyStatus = async () => {
-    const hit = await readApiKey();
-    let route = { configured: false };
+  const readApiKeyRoute = () => {
     const service = settingsService();
-    if (service !== void 0) {
-      try {
-        const descriptor = service.describe().find((row) => row.ns === SETTINGS_NS);
-        const current = descriptor?.value?.providers?.[API_KEY_PROVIDER];
-        route =
-          current === undefined
-            ? { configured: false }
-            : {
-                configured: true,
-                apiKeyEnv: typeof current.apiKeyEnv === 'string' ? current.apiKeyEnv : undefined,
-                transport: typeof current.transport === 'string' ? current.transport : undefined,
-              };
-      } catch {
-        route = { configured: false, error: 'cannot read settings' };
-      }
+    if (service === void 0) return { configured: false, catalogDestination: false, reason: 'no-settings-service' };
+    let descriptor;
+    try {
+      descriptor = service.describe().find((row) => row.ns === SETTINGS_NS);
+    } catch {
+      return { configured: false, catalogDestination: false, reason: 'describe-failed' };
     }
+    const current = descriptor?.value?.providers?.[API_KEY_PROVIDER];
+    if (current === undefined) return { configured: false, catalogDestination: false, reason: 'not-configured' };
+
+    // Values the installed catalog supplies when the profile leaves them out.
+    const baseURL = typeof current.baseURL === 'string' && current.baseURL !== '' ? current.baseURL : CATALOG_OPENAI_BASE_URL;
+    const api = typeof current.api === 'string' && current.api !== '' ? current.api : CATALOG_OPENAI_API;
     return {
-      ref: settings.apiKeyEnv,
-      enabled: settings.enableApiKeyRoute,
-      configured: hit.configured,
-      ...(hit.source === undefined ? {} : { source: hit.source }),
-      ...apiKeyFacts(hit.value),
-      route,
+      configured: true,
+      ...(typeof current.apiKeyEnv === 'string' ? { apiKeyEnv: current.apiKeyEnv } : {}),
+      baseURL,
+      api,
+      ...(typeof current.transport === 'string' ? { transport: current.transport } : {}),
+      catalogDestination: baseURL === CATALOG_OPENAI_BASE_URL && api === CATALOG_OPENAI_API,
     };
   };
 
   /**
-   * Store a Platform key, and make sure something serves it.
+   * Which reference the live route resolves, and whether it is safe to probe.
    *
-   * The key goes through the credential seam (`set`), which is what the Models
-   * page writes too — same file, same reference, one secret. `set` refuses an
-   * empty value by design, so clearing has its own path.
-   *
-   * Validation is deliberately about shape, not validity: a wrong-but
-   * well-formed key must be storable so the probe can say *why* it is wrong, and
-   * the probe is the only honest judge of a key that carries no expiry.
-   *
-   * @returns `{ ok, ref, route?, source? }`.
+   * The route wins over the plugin's own setting: whichever reference the route
+   * binds is the one whose key will actually be sent, so that is the one worth
+   * reporting. When no route exists yet the configured reference is a prediction,
+   * not a fact, and is marked as such.
    */
-  const writeApiKey = async (value) => {
-    const store = credentials();
-    if (store === void 0) throw new Error('没有挂载凭据服务（dsh-credentials-local），无法保存 API key。');
-    if (typeof store.set !== 'function') throw new Error('此凭据服务不支持写入 reference（缺少 set）。');
-
-    const key = typeof value === 'string' ? value.trim() : '';
-    if (key === '') throw new Error('API key 不能为空。');
-    if (/\s/.test(key)) throw new Error('API key 里不应包含空白字符，请检查是否复制时带了换行。');
-    if (key.length < 20) throw new Error('这看起来不像一个 OpenAI API key（长度过短）。');
-
-    await store.set(settings.apiKeyEnv, key);
-    const route = settings.enableApiKeyRoute ? await ensureApiKeyRoute() : { changed: false, reason: 'disabled' };
-    return { ok: true, ref: settings.apiKeyEnv, route };
-  };
-
-  /** Remove the stored Platform key. Never touches the ChatGPT grant. */
-  const clearApiKey = async () => {
-    const store = credentials();
-    if (store === void 0) throw new Error('没有挂载凭据服务（dsh-credentials-local）。');
-    if (typeof store.unset !== 'function') throw new Error('此凭据服务不支持删除 reference（缺少 unset）。');
-    await store.unset(settings.apiKeyEnv);
-    return { ok: true, ref: settings.apiKeyEnv };
+  const effectiveApiKeyBinding = () => {
+    const route = readApiKeyRoute();
+    if (route.configured === true && typeof route.apiKeyEnv === 'string') {
+      return { ref: route.apiKeyEnv, fromRoute: true, ...route };
+    }
+    return { ref: settings.apiKeyEnv, fromRoute: false, ...route };
   };
 
   /**
-   * Ask `api.openai.com` whether the stored key works.
+   * Everything the panel may know about the Platform key, and nothing more.
    *
-   * A stored key has no local evidence of validity at all — `sk-…` is opaque, so
-   * unlike the OAuth grant there is no `exp` to read and no refresh to attempt.
-   * The probe is therefore the only answer to "is this key live", and it says
-   * which of the three failures it hit so the panel can point at the right fix.
+   * The value itself never leaves this function: the panel gets `configured`,
+   * the reference name, where the value came from, which family the key belongs
+   * to, and whether the route in force points at the catalog destination. A user
+   * who wants to check the key can run the probe; showing it back would only make
+   * it visible in a screenshot.
+   */
+  const readApiKeyStatus = async () => {
+    const binding = effectiveApiKeyBinding();
+    const hit = await readApiKey(binding.ref);
+    const mismatched = binding.fromRoute === true && binding.ref !== settings.apiKeyEnv;
+    return {
+      ref: binding.ref,
+      configuredRef: settings.apiKeyEnv,
+      enabled: settings.enableApiKeyRoute,
+      configured: hit.configured,
+      ...(hit.source === undefined ? {} : { source: hit.source }),
+      ...apiKeyFacts(hit.value),
+      route: {
+        configured: binding.configured,
+        ...(binding.apiKeyEnv === undefined ? {} : { apiKeyEnv: binding.apiKeyEnv }),
+        ...(binding.baseURL === undefined ? {} : { baseURL: binding.baseURL }),
+        ...(binding.transport === undefined ? {} : { transport: binding.transport }),
+        catalogDestination: binding.catalogDestination === true,
+      },
+      // Two ways to be pointed somewhere this plugin must not touch: the route
+      // binds another reference, or it sends traffic to another endpoint.
+      ...(mismatched ? { bindingMismatch: 'reference' } : {}),
+      ...(binding.configured === true && binding.catalogDestination !== true ? { bindingMismatch: 'destination' } : {}),
+    };
+  };
+
+  /**
+   * Ask `api.openai.com` whether the key the route actually uses may list models.
+   *
+   * Two guards run before any request leaves the machine, both of them about the
+   * destination rather than the key:
+   *
+   *   - a route bound to a different reference means the key under this plugin's
+   *     setting is not the one in force, so there is nothing here to verify;
+   *   - a route with a custom `baseURL`/`api` points at another service, and its
+   *     key must not be replayed to `api.openai.com`.
+   *
+   * In both cases the answer is a report, not a request. What a 2xx proves is
+   * only that the key may *list models* — never that inference or billing works.
    */
   const verifyApiKey = async (signal) => {
-    const hit = await readApiKey();
+    const binding = effectiveApiKeyBinding();
+    if (binding.configured === true && binding.ref !== settings.apiKeyEnv) {
+      return {
+        ok: false,
+        code: 'BINDING_MISMATCH',
+        detail: `openai route 绑定的是 ${binding.ref}，不是本插件的 ${settings.apiKeyEnv}；`
+          + '那条 route 的 key 由它的配置所有者负责，本插件不会拿自己的 reference 去验证它。',
+        ref: binding.ref,
+      };
+    }
+    if (binding.configured === true && binding.catalogDestination !== true) {
+      return {
+        ok: false,
+        code: 'CUSTOM_DESTINATION',
+        detail: `openai route 指向自定义端点（${binding.baseURL}），不是 api.openai.com；`
+          + '这把 key 是给那个端点签发的，本插件不会把它发到别处。',
+        ref: binding.ref,
+      };
+    }
+
+    const hit = await readApiKey(binding.ref);
     if (hit.configured !== true || typeof hit.value !== 'string') {
-      return { ok: false, code: 'NO_CREDENTIAL', detail: `还没有保存 API key（reference ${settings.apiKeyEnv}）。` };
+      return { ok: false, code: 'NO_CREDENTIAL', detail: `还没有保存 API key（reference ${binding.ref}）。` };
     }
     const result = await probeApiKey(hit.value, signal);
-    return { ...result, ref: settings.apiKeyEnv, family: apiKeyFacts(hit.value).family };
+    return { ...result, ref: binding.ref, family: apiKeyFacts(hit.value).family };
   };
 
   // ---------------------------------------------------------------- status ---
@@ -1551,11 +1655,19 @@ export function apply(ctx, rawConfig) {
             const bound =
               key.route?.configured === true
                 ? `route 已启用${key.route.apiKeyEnv ? `，绑定 ${key.route.apiKeyEnv}` : '（未绑定 apiKeyEnv，走 pi-ai 自己的环境发现）'}`
-                : 'route 未启用（保存 key 时会自动补上）';
+                : 'route 未启用（写入 key 或调用 /gpt-codex/api-key/route 时补上）';
             lines.push(
               `- OpenAI API key：${key.configured ? `已保存（${key.family === 'project' ? 'project key' : key.family === 'user' ? 'user key' : '类型未识别'}${key.source ? `，来源 ${key.source}` : ''}）` : '未保存'} · reference ${key.ref}`,
             );
             lines.push(`- openai route（API key）：${bound}`);
+            // Whose key the route actually sends is a separate fact from whether a
+            // key exists, and it decides whether a probe is safe at all.
+            if (key.bindingMismatch === 'reference') {
+              lines.push(`  → route 绑定的是 ${key.route?.apiKeyEnv}，不是本插件的 ${key.configuredRef}；写入与验证都以它的配置所有者为准。`);
+            } else if (key.bindingMismatch === 'destination') {
+              lines.push(`  → route 指向自定义端点 ${key.route?.baseURL}，不是 api.openai.com；本插件不会把 key 发到别处验证。`);
+            }
+            lines.push('  → key 的写入与删除在「设置 → 模型」完成；本插件只读不写，也不提供接收原始 key 的工具。');
           }
 
           lines.push(`- 浏览器 OAuth 流：${value.flowAvailable ? '已注册，可在面板发起' : '未注册'}`);
@@ -1600,14 +1712,20 @@ export function apply(ctx, rawConfig) {
           if (keyProbe !== undefined) {
             lines.push(
               keyProbe.ok === true
-                ? `- API key 真实验证：通过 —— ${keyProbe.detail}`
-                : `- API key 真实验证：失败 —— ${keyProbe.detail}`,
+                ? `- API key 验证（/v1/models）：通过 —— ${keyProbe.detail}`
+                : `- API key 验证（/v1/models）：失败 —— ${keyProbe.detail}`,
             );
             if (keyProbe.ok !== true && keyProbe.code === 'UNAUTHORIZED') {
               lines.push('  → 这个 key 被 api.openai.com 拒绝：确认它没有被撤销，且属于你当前所在的组织/项目。');
             }
             if (keyProbe.ok !== true && keyProbe.code === 'QUOTA') {
-              lines.push('  → key 本身有效，但额度或速率受限：检查该项目的余额与用量上限。');
+              lines.push('  → 这次没能列出模型（额度或速率受限）。这不等于 key 无效，也不等于验证通过。');
+            }
+            if (keyProbe.ok !== true && keyProbe.code === 'CUSTOM_DESTINATION') {
+              lines.push('  → route 指向自定义端点，key 不归 api.openai.com 校验；没有发出任何请求。');
+            }
+            if (keyProbe.ok !== true && keyProbe.code === 'BINDING_MISMATCH') {
+              lines.push('  → route 绑定了别的 reference；那把 key 由它的配置所有者负责，本插件没有验证它。');
             }
           }
           return [{ type: 'text', text: lines.join('\n') }];
@@ -1749,75 +1867,13 @@ export function apply(ctx, rawConfig) {
       },
     });
 
-    register({
-      name: 'gpt_set_api_key',
-      description:
-        '用一个 OpenAI Platform API key（sk-…）接入 GPT：把 key 写进 Harness 凭据库，并确保 llm-pi-ai 启用了 openai 这条 route。'
-        + ' 与 gpt_sign_in 是两条独立的路：这条走 api.openai.com 的按量计费，不需要 ChatGPT 订阅，也不影响已有的订阅登录。',
-      parameters: {
-        type: 'object',
-        properties: {
-          apiKey: { type: 'string', description: 'OpenAI API key（通常以 sk- 或 sk-proj- 开头）。' },
-          verify: { type: 'boolean', description: '写入后是否立刻向 api.openai.com 验证一次，默认 true。' },
-        },
-        required: ['apiKey'],
-        additionalProperties: false,
-      },
-      output: {
-        schema: { type: 'object', properties: {}, additionalProperties: true },
-        render: (_args, value) => {
-          if (value.ok !== true) return [{ type: 'text', text: `API key 未写入：${value.error}` }];
-          const routeNote = value.route?.changed
-            ? '已自动启用 llm-pi-ai 的 openai route'
-            : value.route?.reason === 'already-configured'
-              ? 'openai route 早已存在且绑定同一个 reference'
-              : `openai route 未改动（${value.route?.reason ?? 'unknown'}）`;
-          const lines = [`已把 API key 写入凭据库（reference ${value.ref}）。${routeNote}。`];
-          const probe = value.probe;
-          if (probe !== undefined) {
-            lines.push(
-              probe.ok === true
-                ? `真实验证：通过 —— ${probe.detail}`
-                : `真实验证：失败 —— ${probe.detail}`,
-            );
-          } else {
-            lines.push('未做真实验证；需要确认这个 key 可用时调用 gpt_status。');
-          }
-          lines.push('现在可以在模型列表里选择 openai 这条 provider 下的模型。');
-          return [{ type: 'text', text: lines.join('\n') }];
-        },
-      },
-      async execute(args) {
-        try {
-          const written = await writeApiKey(args?.apiKey);
-          const probe = args?.verify === false ? undefined : await verifyApiKey();
-          return { ...written, ...(probe === undefined ? {} : { probe }) };
-        } catch (error) {
-          return { ok: false, error: error && error.message ? error.message : String(error) };
-        }
-      },
-    });
-
-    register({
-      name: 'gpt_clear_api_key',
-      description:
-        '删除本机保存的 OpenAI Platform API key（只清 reference，不向 OpenAI 撤销该 key，也不影响 ChatGPT 订阅登录）。',
-      parameters: { type: 'object', properties: {}, additionalProperties: false },
-      output: {
-        schema: { type: 'object', properties: {}, additionalProperties: true },
-        render: (_args, value) =>
-          value.ok === true
-            ? [{ type: 'text', text: `已删除本机保存的 API key（reference ${value.ref}）。` }]
-            : [{ type: 'text', text: `删除失败：${value.error}` }],
-      },
-      async execute() {
-        try {
-          return await clearApiKey();
-        } catch (error) {
-          return { ok: false, error: error && error.message ? error.message : String(error) };
-        }
-      },
-    });
+  // Deliberately absent: `gpt_set_api_key` and `gpt_clear_api_key`.
+  //
+  // A tool that takes a raw `sk-…` argument writes the secret into the assistant's
+  // own message before the tool runs, so trimming it out of the result protects
+  // nothing; and a tool that unsets a reference can delete a secret another route
+  // depends on. Writing and deleting credentials belongs to the authenticated
+  // Models UI, which this plugin points at instead of re-implementing.
   });
 
   // ------------------------------------------------------------------ routes ---
@@ -2088,31 +2144,25 @@ export function apply(ctx, rawConfig) {
   });
 
   /**
-   * Store a key.
+   * Read-only view of the key and its route; the secret is never echoed.
    *
-   * The key arrives in a request body, never in a URL, so it does not end up in a
-   * log line or a shell history. Nothing is echoed back.
+   * There is deliberately no `POST`/`DELETE` here. Writing and deleting a
+   * credential is the authenticated Models UI's job: a plain HTTP handler on this
+   * plugin's own prefix would be a second, unauthenticated write path to a shared
+   * reference, and two owners of one secret is how one of them silently breaks the
+   * other. The panel links to the Models page instead.
    */
-  route(`${API_PREFIX}/api-key`, async (req, res) => {
-    if (req.method === 'POST') {
-      const body = await readJsonBody(req);
-      const written = await writeApiKey(body.apiKey);
-      const probe = body.verify === false ? undefined : await verifyApiKey();
-      return sendJson(res, 200, { ...written, ...(probe === undefined ? {} : { probe }) });
-    }
-    if (req.method === 'DELETE') {
-      return sendJson(res, 200, await clearApiKey());
-    }
-    return sendJson(res, 405, { error: { message: 'POST or DELETE only' } });
-  });
-
-  /** Status of the key and its route, without echoing the secret. */
   route(`${API_PREFIX}/api-key/status`, async (req, res) => {
     if (req.method !== 'GET') return sendJson(res, 405, { error: { message: 'GET only' } });
     sendJson(res, 200, await readApiKeyStatus());
   });
 
-  /** Live check against `api.openai.com`. Costs no tokens. */
+  /**
+   * Ask the destination whether the key in force may list models. Costs no tokens.
+   *
+   * Reports rather than requests when the route is bound elsewhere — see
+   * {@link verifyApiKey}.
+   */
   route(`${API_PREFIX}/api-key/verify`, async (req, res) => {
     if (req.method !== 'GET') return sendJson(res, 405, { error: { message: 'GET only' } });
     sendJson(res, 200, { ok: true, probe: await verifyApiKey() });
